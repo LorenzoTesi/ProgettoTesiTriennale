@@ -24,9 +24,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("Sistema di Sorveglianza Intelligente")
-st.caption("Dashboard eventi + analisi anomalie + sintesi LLM locale")
-
+# FUNZIONI DI CHIAMATA API
 def get_cameras():
     try:
         r = requests.get(f"{API_BASE_URL}/cameras", timeout=10)
@@ -35,7 +33,6 @@ def get_cameras():
     except Exception as e:
         st.error(f"Errore recupero camere: {e}")
         return []
-
 
 def get_events(params):
     try:
@@ -48,7 +45,6 @@ def get_events(params):
         st.error(f"Errore connessione: {e}")
     return None
 
-
 def get_stats(params):
     try:
         r = requests.get(f"{API_BASE_URL}/stats", params=params, timeout=30)
@@ -57,7 +53,6 @@ def get_stats(params):
     except Exception as e:
         st.error(f"Errore statistiche: {e}")
         return None
-
 
 def generate_summary(payload):
     try:
@@ -70,25 +65,49 @@ def generate_summary(payload):
         st.error(f"Errore connessione LLM: {e}")
     return None
 
+# Inizializza lo stato delle telecamere nel session_state se non esiste già
+if "camera_status" not in st.session_state:
+    cameras_list = get_cameras()
+    # all'inizio tutte le telecamere sono attive
+    st.session_state.camera_status = {c["camera_id"]: True for c in cameras_list}
 
-#SIDEBAR - FILTRI
+# INTERFACCIA: titolo e pulsanti delle telecamere
+st.title("Sistema di Sorveglianza Intelligente")
+st.caption("Dashboard eventi + analisi anomalie + sintesi LLM locale")
+st.subheader("Stato telecamere")
+st.write("Clicca su una telecamera per escluderla/includerla dalla ricerca:")
+
+cameras_data = get_cameras()
+if cameras_data:
+    cols = st.columns(len(cameras_data))
+
+    for idx, c in enumerate(cameras_data):
+        cam_id = c["camera_id"]
+        cam_loc = c["location"]
+        is_active = st.session_state.camera_status.get(cam_id, True)
+        label = f"🟢 {cam_id}\n({cam_loc})" if is_active else f"🔴 {cam_id}\n(DISATTIVATA)"
+        # parametro type="primary" per evidenziare quelle attive
+        btn_type = "primary" if is_active else "secondary"
+
+        # Disegna il pulsante nella sua colonna
+        if cols[idx].button(label, key=f"btn_{cam_id}", type=btn_type, use_container_width=True):
+            # cliccare inverte lo stato
+            st.session_state.camera_status[cam_id] = not is_active
+            st.rerun()  # forza ad aggiornare la pagina con i nuovi colori
+
+# SIDEBAR - FILTRI
 st.sidebar.header(" Filtri")
 
 today = date.today()
 start_date = st.sidebar.date_input("Data iniziale", value=today)
 end_date = st.sidebar.date_input("Data finale", value=today)
-start_time = st.sidebar.time_input("Ora iniziale", value=time(0, 0))
+
+# MODIFICA: Impostato il default alle 00:01 del giorno corrente
+start_time = st.sidebar.time_input("Ora iniziale", value=time(0, 1))
 end_time = st.sidebar.time_input("Ora finale", value=time(23, 59))
 
 start_dt = datetime.combine(start_date, start_time)
 end_dt = datetime.combine(end_date, end_time)
-
-camera_options = ["tutte"]
-cameras = get_cameras()
-for c in cameras:
-    camera_options.append(c["camera_id"])
-
-selected_camera = st.sidebar.selectbox("Camera", camera_options)
 
 event_type = st.sidebar.selectbox(
     "Tipo evento",
@@ -100,25 +119,31 @@ limit = st.sidebar.slider("Numero massimo eventi", min_value=10, max_value=1000,
 
 load_button = st.sidebar.button("Carica eventi")
 
-#COMPOSIZIONE QUERY PARAMS
+# Prendi la lista di tutte le camere che sono ATTIVE (True) nei pulsanti in alto
+camere_attive = [cam_id for cam_id, active in st.session_state.camera_status.items() if active]
+all_cameras = list(st.session_state.camera_status.keys())
+
+# COMPOSIZIONE QUERY PARAMS (Pulita e senza ripetizioni del dizionario)
 params = {
     "start": start_dt.isoformat(),
     "end": end_dt.isoformat(),
     "limit": limit,
 }
-if selected_camera != "tutte":
-    params["camera_id"] = selected_camera
+
 if event_type != "tutti":
     params["event_type"] = event_type
+
 if keyword:
     params["keyword"] = keyword
 
-#CREAZIONE DELLE SCHEDE NEL MAIN PANEL
+if camere_attive:
+    params["camera_ids"] = camere_attive
+
+# CREAZIONE DELLE TABS
 tab_dashboard, tab_intelligenza_art = st.tabs(["Monitoraggio Eventi", "Analisi e Sintesi AI"])
 
 
-#SCHEDA 1: VISUALIZZAZIONE DATI E GRAFICI
-
+# SCHEDA 1: VISUALIZZAZIONE DATI E GRAFICI
 with tab_dashboard:
     if load_button:
         with st.spinner("Recupero eventi dal backend..."):
@@ -140,12 +165,14 @@ with tab_dashboard:
                             "confidence": e.get("metadata", {}).get("confidence"),
                         })
                     df = pd.DataFrame(rows)
+
+                    # Generazione parametri per le statistiche
                     stats_params = {
                         "start": start_dt.isoformat(),
                         "end": end_dt.isoformat(),
                     }
-                    if selected_camera != "tutte":
-                        stats_params["camera_id"] = selected_camera
+                    if camere_attive:
+                        stats_params["camera_ids"] = camere_attive
 
                     stats = get_stats(stats_params)
 
@@ -168,12 +195,11 @@ with tab_dashboard:
                     st.subheader("Lista eventi")
                     st.dataframe(df, use_container_width=True, hide_index=True)
                 else:
-                    st.warning("Nessun evento trovato")
+                    st.warning("Nessun evento trovato per i criteri o per le telecamere selezionate.")
     else:
         st.info("💡 Imposta i filtri nella barra laterale a sinistra e clicca su 'Carica eventi'.")
 
-#SCHEDA 2: LOGICA DI SINTESI GENERATIVA (OLLAMA)
-
+# SCHEDA 2: LOGICA GENERATIVA (OLLAMA)
 with tab_intelligenza_art:
     st.subheader("Analisi Semantica con LLM Locale")
     st.write("Genera un report narrativo basato sulle fasce orarie e sui criteri di sicurezza stabiliti.")
@@ -181,11 +207,12 @@ with tab_intelligenza_art:
     if st.button("Avvia Elaborazione Sintesi"):
         payload = {
             "start": start_dt.isoformat(),
+            "end": end_dt.isoformat(),
         }
-        #gestione coerenza con ollama.py
-        payload["end"] = end_dt.isoformat()
-        if selected_camera != "tutte":
-            payload["camera_id"] = selected_camera
+
+        # Comunica a Ollama su quali telecamere fare il riassunto
+        if camere_attive:
+            payload["camera_ids"] = camere_attive
 
         with st.spinner("Il server locale Ollama sta analizzando i dati... Attendi..."):
             summary_data = generate_summary(payload)
@@ -210,11 +237,11 @@ with tab_intelligenza_art:
                 else:
                     st.success("Nessuna anomalia critica rilevata dall'algoritmo orario.")
 
-                # sezione Risposta Testuale Generata da Llama3
                 st.subheader("Report Generato da Ollama")
                 st.markdown(summary_data["summary"])
 
-#FOOTER
+# FOOTER
 st.divider()
 st.caption(
-    "Sistema di archiviazione, rilevazione e sintesi eventi — FastAPI + MongoDB Atlas + Ollama Locale + Streamlit")
+    "Sistema di archiviazione, rilevazione e sintesi eventi — FastAPI + MongoDB Atlas + Ollama Locale + Streamlit"
+)
