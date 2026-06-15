@@ -1,35 +1,32 @@
-"""
-simulator.py — Generatore di eventi di sorveglianza simulati
+
+#simulator.py — Generatore di eventi di sorveglianza simulati
 
 # 1. Prima verifica che il backend FastAPI sia acceso:
-#    uvicorn main_ollama:app --reload
-#
+#    uvicorn Ollama:app --reload
+
 # 2. Salva gli eventi in un file JSON (senza inviare nulla):
 #    python simulator.py --output preview.json
-#
+
 # 3. Invia gli eventi al backend in blocco (veloce, per test):
 #    python simulator.py --stream --interval 0
-#
-# 4. Invia gli eventi lentamente, uno al secondo (simula real-time):
-#    python simulator.py --stream --interval 1
-#
-# 5. Personalizza il periodo e la frequenza:
-#    python simulator.py --stream --start 2026-04-30T06:00:00 --end 2026-04-30T23:00:00 --freq 15 --anomaly-rate 0.1
-#
-# 6. Solo eventi notturni (più anomalie):
-#    python simulator.py --stream --start 2026-04-30T22:00:00 --end 2026-05-01T06:00:00 --anomaly-rate 0.3
 
-PARAMETRI
-  --start         datetime inizio simulazione  (default: oggi 06:00)
-  --end           datetime fine simulazione    (default: oggi 23:00)
-  --freq          eventi medi per ora          (default: 10)
-  --anomaly-rate  probabilità anomalia 0-1     (default: 0.08)
-  --stream        invia al backend invece di salvare su file
-  --interval      secondi tra un invio e l'altro in modalità stream (default: 0.2)
-  --url           URL del backend              (default: http://127.0.0.1:8000)
-  --output        file JSON di output locale   (default: events_preview.json)
-  --check         solo verifica connessione al backend, non genera eventi
-"""
+# 4. Invia gli eventi lentamente, uno al secondo:
+#    python simulator.py --stream --interval 1
+
+# 5. Personalizza il periodo, la frequenza è la probabilità di generare un'anomalia:
+#    python simulator.py --stream --start 2026-04-30T06:00:00 --end 2026-04-30T23:00:00 --freq 15 --anomaly-rate 0.1
+
+#Parametri
+# --start         datetime inizio simulazione  (default: oggi 06:00)
+# --end           datetime fine simulazione    (default: oggi 23:00)
+# --freq          eventi medi per ora          (default: 10)
+# --anomaly-rate  probabilità anomalia 0-1     (default: 0.08)
+# --stream        invia al backend invece di salvare su file
+# --interval      secondi tra un invio e l'altro in modalità stream (default: 0.2)
+# --url           URL del backend              (default: http://127.0.0.1:8000)
+# --output        file JSON di output locale   (default: events_preview.json)
+#  --check         solo verifica connessione al backend, non genera eventi
+
 
 import argparse
 import json
@@ -41,7 +38,7 @@ from datetime import datetime, timedelta
 import httpx
 
 
-#DATI DI RIFERIMENTO
+#Dati di riferimento
 
 CAMERAS = {
     "corridor_1": "corridoio principale",
@@ -55,7 +52,6 @@ CAMERAS = {
 NORMAL_EVENTS = {
     "movement": [
         "una persona cammina per la stanza",
-        "un gruppo di persone camminano per la stanza",
         "una persona si dirige verso la porta"
     ],
     "idle": [
@@ -64,7 +60,7 @@ NORMAL_EVENTS = {
         "dipendente in pausa",
     ],
     "crowd": [
-        "fila allo sportello",
+        "gruppo di persone in fila",
         "gruppo di dipendenti a lavoro",
     ],
 }
@@ -97,10 +93,7 @@ TAGS_MAP = {
 #LOGICA DI GENERAZIONE
 
 def expected_activity(hour: int) -> float:
-    """
-    Moltiplicatore di attività per ora del giorno.
-    1.5 = rush hour mattina/sera, 1.0 = normale, 0.05 = notte
-    """
+
     if 8 <= hour < 10 or 17 <= hour < 19:
         return 1.5
     if 10 <= hour < 12 or 14 <= hour < 17:
@@ -184,8 +177,8 @@ def generate_events(
 
 #INVIO AL BACKEND
 
+#verifica che il backend FastAPI sia raggiungibile
 def check_backend(url: str) -> bool:
-    """Verifica che il backend FastAPI sia raggiungibile."""
     try:
         r = httpx.get(f"{url}/", timeout=5)
         r.raise_for_status()
@@ -200,9 +193,9 @@ def check_backend(url: str) -> bool:
         print(f" Errore connessione: {e}")
         return False
 
-
+#Invia un singolo evento via POST /events. Restituisce True se ok
 def send_event(event: dict, url: str) -> bool:
-    """Invia un singolo evento via POST /events. Restituisce True se ok."""
+
     try:
         r = httpx.post(f"{url}/events", json=event, timeout=5)
         r.raise_for_status()
