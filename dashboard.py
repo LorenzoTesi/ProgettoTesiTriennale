@@ -1,8 +1,7 @@
 # Dashboard Streamlit per:
 # - visualizzare eventi
 # - filtrare per data/camera/tipo
-# - vedere statistiche
-# - generare sintesi LLM via Ollama locale
+# - generare sintesi LLM via Ollama locale o fare richieste personalizzate
 #
 # AVVIO:
 # streamlit run dashboard.py
@@ -22,7 +21,8 @@ st.set_page_config(
     layout="wide",
 )
 
-#funzioni chiamata API
+
+# funzioni chiamata API
 def get_cameras():
     try:
         r = requests.get(f"{API_BASE_URL}/cameras", timeout=10)
@@ -31,6 +31,7 @@ def get_cameras():
     except Exception as e:
         st.error(f"Errore recupero camere: {e}")
         return []
+
 
 def get_events(params):
     try:
@@ -43,6 +44,7 @@ def get_events(params):
         st.error(f"Errore connessione: {e}")
     return None
 
+
 def get_stats(params):
     try:
         r = requests.get(f"{API_BASE_URL}/stats", params=params, timeout=30)
@@ -50,7 +52,8 @@ def get_stats(params):
         return r.json()
     except Exception as e:
         st.error(f"Errore statistiche: {e}")
-        return None
+    return None
+
 
 def generate_summary(payload):
     try:
@@ -63,15 +66,22 @@ def generate_summary(payload):
         st.error(f"Errore connessione LLM: {e}")
     return None
 
-#Inizializza lo stato delle telecamere nel session_state se non esiste già
+
+# Inizializza lo stato delle telecamere nel session_state se non esiste già
 if "camera_status" not in st.session_state:
     cameras_list = get_cameras()
     # all'inizio tutte le telecamere sono attive
     st.session_state.camera_status = {c["camera_id"]: True for c in cameras_list}
 
-#INTERFACCIA: titolo e pulsanti delle telecamere
+if "loaded_events" not in st.session_state:
+    st.session_state.loaded_events = None
+if "loaded_stats" not in st.session_state:
+    st.session_state.loaded_stats = None
+if "excluded_events" not in st.session_state:
+    st.session_state.excluded_events = set()
+
+# INTERFACCIA: titolo e pulsanti delle telecamere
 st.title("Sistema di Sorveglianza Intelligente")
-st.caption("Dashboard eventi + analisi anomalie + sintesi LLM locale")
 st.subheader("Stato telecamere")
 st.write("Clicca su una telecamera per escluderla/includerla dalla ricerca:")
 
@@ -91,14 +101,14 @@ if cameras_data:
             st.session_state.camera_status[cam_id] = not is_active
             st.rerun()
 
-#SIDEBAR
+# SIDEBAR
 st.sidebar.header(" Filtri")
 
 today = date.today()
 start_date = st.sidebar.date_input("Data iniziale", value=today)
 end_date = st.sidebar.date_input("Data finale", value=today)
 
-#default alle 00:01 del giorno corrente
+# default alle 00:01 del giorno corrente
 start_time = st.sidebar.time_input("Ora iniziale", value=time(0, 1))
 end_time = st.sidebar.time_input("Ora finale", value=time(23, 59))
 
@@ -107,19 +117,33 @@ end_dt = datetime.combine(end_date, end_time)
 
 event_type = st.sidebar.selectbox(
     "Tipo evento",
-    ["tutti", "movement", "idle", "crowd", "intrusion", "loitering", "anomaly"],
+    ["tutti", "movement", "idle", "crowd"],
 )
 
-keyword = st.sidebar.text_input("Keywords", placeholder="es. porta, gruppo, caduta")
-limit = st.sidebar.slider("Numero massimo eventi", min_value=10, max_value=1000, value=100, step=10)
+opzioni_limite = {
+    "Tutti (Nessun limite)": 0,
+    "10 eventi": 10,
+    "25 eventi": 25,
+    "50 eventi": 50,
+    "100 eventi": 100,
+    "250 eventi": 250,
+    "500 eventi": 500,
+    "1000 eventi": 1000
+}
+
+limite_selezionato = st.sidebar.selectbox(
+    "Numero massimo eventi",
+    options=list(opzioni_limite.keys()),
+    index=3  # Imposta di default "100 eventi" (la quarta opzione, indice 3)
+)
+limit = opzioni_limite[limite_selezionato]
 
 load_button = st.sidebar.button("Carica eventi")
 
-#Prende la lista di tutte le camere che sono ATTIVE (True) nei pulsanti in alto
+# Prende la lista di tutte le camere che sono attive
 camere_attive = [cam_id for cam_id, active in st.session_state.camera_status.items() if active]
 all_cameras = list(st.session_state.camera_status.keys())
 
-# COMPOSIZIONE QUERY PARAMS
 params = {
     "start": start_dt.isoformat(),
     "end": end_dt.isoformat(),
@@ -129,119 +153,157 @@ params = {
 if event_type != "tutti":
     params["event_type"] = event_type
 
-if keyword:
-    params["keyword"] = keyword
-
 if camere_attive:
     params["camera_ids"] = camere_attive
 
-# CREAZIONE DELLE TABS
+
+if load_button:
+    with st.spinner("Recupero eventi dal backend..."):
+        data = get_events(params)
+        if data is not None:
+            st.session_state.loaded_events = data["events"]
+            st.session_state.excluded_events = set()
+
+            stats_params = {
+                "start": start_dt.isoformat(),
+                "end": end_dt.isoformat(),
+            }
+            if camere_attive:
+                stats_params["camera_ids"] = camere_attive
+            st.session_state.loaded_stats = get_stats(stats_params)
+
 tab_dashboard, tab_intelligenza_art = st.tabs(["Monitoraggio Eventi", "Analisi e Sintesi AI"])
 
-
-# SCHEDA 1: VISUALIZZAZIONE DATI E GRAFICI
+# Tab 1: Visualizzazione dati
 with tab_dashboard:
-    if load_button:
-        with st.spinner("Recupero eventi dal backend..."):
-            data = get_events(params)
+    if st.session_state.loaded_events is not None:
+        events = st.session_state.loaded_events
 
-            if data is not None:
-                events = data["events"]
-                st.success(f"Recuperati {len(events)} eventi")
+        if events:
+            rows = []
+            for e in events:
+                rows.append({
+                    "_id": e["_id"],
+                    "timestamp": e["timestamp"],
+                    "camera": e["camera_id"],
+                    "location": e["location"],
+                    "event_type": e["event_type"],
+                    "description": e["description"],
+                    "confidence": e.get("metadata", {}).get("confidence"),
+                })
+            df = pd.DataFrame(rows)
 
-                if events:
-                    rows = []
-                    for e in events:
-                        rows.append({
-                            "timestamp": e["timestamp"],
-                            "camera": e["camera_id"],
-                            "location": e["location"],
-                            "event_type": e["event_type"],
-                            "description": e["description"],
-                            "confidence": e.get("metadata", {}).get("confidence"),
-                        })
-                    df = pd.DataFrame(rows)
+            stats = st.session_state.loaded_stats
+            if stats:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Totale eventi", stats["total_events"])
+                with col2:
+                    st.metric("Camere attive", len(stats["by_camera"]))
 
-                    # Generazione parametri per le statistiche
-                    stats_params = {
-                        "start": start_dt.isoformat(),
-                        "end": end_dt.isoformat(),
-                    }
-                    if camere_attive:
-                        stats_params["camera_ids"] = camere_attive
+            n_esclusi = len(st.session_state.excluded_events)
+            st.subheader("Lista eventi")
+            st.caption(
+                f"Clicca su un evento per escluderlo dall'analisi LLM. "
+                f"Eventi esclusi: **{n_esclusi}** / {len(events)}"
+            )
 
-                    stats = get_stats(stats_params)
+            if n_esclusi > 0:
+                if st.button("Ripristina tutti gli eventi"):
+                    st.session_state.excluded_events = set()
+                    st.rerun()
 
-                    if stats:
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            st.metric("Totale eventi", stats["total_events"])
-                        with col2:
-                            st.metric("Anomalie", stats["anomaly_count"])
-                        with col3:
-                            st.metric("Camere attive", len(stats["by_camera"]))
+            header = st.columns([2, 1.5, 2, 1.2, 3, 1, 1.2])
+            headers_text = ["Timestamp", "Camera", "Location", "Tipo", "Descrizione", "Confidence", "Azione"]
+            for col, label in zip(header, headers_text):
+                col.markdown(f"**{label}**")
+            st.divider()
 
-                    st.subheader("Breakdown per tipo evento")
+            for _, row in df.iterrows():
+                event_id = row["_id"]
+                escluso = event_id in st.session_state.excluded_events
 
-                    breakdown_df = pd.DataFrame(
-                        {"Numero Eventi": list(stats["by_event_type"].values())},
-                        index=list(stats["by_event_type"].keys())
-                    )
-                    st.bar_chart(breakdown_df, horizontal=True)
-                    st.subheader("Lista eventi")
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-                else:
-                    st.warning("Nessun evento trovato per i criteri o per le telecamere selezionate.")
+                cols = st.columns([2, 1.5, 2, 1.2, 3, 1, 1.2])
+
+
+                #se l'evento è escluso viene sbarrato
+                def cell(col, testo, escluso):
+                    if escluso:
+                        col.markdown(f"<span style='color:#cc3333; text-decoration:line-through;'>**{testo}**</span>",
+                                     unsafe_allow_html=True)
+                    else:
+                        col.markdown(str(testo))
+
+
+                cell(cols[0], row["timestamp"][11:16] + " " + row["timestamp"][:10], escluso)
+                cell(cols[1], row["camera"], escluso)
+                cell(cols[2], row["location"], escluso)
+                cell(cols[3], row["event_type"], escluso)
+                cell(cols[4], row["description"], escluso)
+                cell(cols[5], row["confidence"], escluso)
+
+                label_btn = "✓ includi" if escluso else "✕ escludi"
+                if cols[6].button(label_btn, key=f"exc_{event_id}", use_container_width=True):
+                    if escluso:
+                        st.session_state.excluded_events.discard(event_id)
+                    else:
+                        st.session_state.excluded_events.add(event_id)
+                    st.rerun()
+
+                st.divider()
+        else:
+            st.warning("Nessun evento trovato per i criteri o per le telecamere selezionate.")
     else:
         st.info("💡 Imposta i filtri nella barra laterale a sinistra e clicca su 'Carica eventi'.")
 
-# SCHEDA 2: LOGICA GENERATIVA (OLLAMA)
+# Tab 2: Logica generativa (Ollama)
 with tab_intelligenza_art:
     st.subheader("Analisi Semantica con LLM Locale")
-    st.write(
-        "Fai una richiesta personalizzata oppure clicca il tasto per una sintesi.")
+    st.write("Fai una richiesta personalizzata oppure clicca il tasto per una sintesi.")
 
     tasto_standard = st.button("Avvia Elaborazione Sintesi Standard")
-    user_custom_prompt = st.chat_input(
-        "Scrivi qui cosa vuoi chiedere a Ollama riguardo agli eventi...")
+    user_custom_prompt = st.chat_input("Scrivi qui cosa vuoi chiedere a Ollama riguardo agli eventi...")
 
     if tasto_standard or user_custom_prompt:
-        payload = {
-            "start": start_dt.isoformat(),
-            "end": end_dt.isoformat(),
-            "custom_prompt": user_custom_prompt if user_custom_prompt else None
-        }
+        eventi_caricati = st.session_state.get("loaded_events", [])
+        esclusi = st.session_state.get("excluded_events", set())
 
-        if camere_attive:
-            payload["camera_ids"] = camere_attive
+        # Filtra via gli eventi che l'utente ha escluso
+        eventi_inclusi = [e for e in eventi_caricati if e["_id"] not in esclusi]
 
-        msg_caricamento = "Ollama sta generando la sintesi standard..." if not user_custom_prompt else f"Ollama sta elaborando la tua richiesta: '{user_custom_prompt}'..."
+        if not eventi_caricati:
+            st.warning("Carica prima gli eventi dal tab 'Monitoraggio Eventi' utilizzando i filtri laterali.")
+        elif not eventi_inclusi:
+            st.warning(
+                "Tutti gli eventi caricati sono stati esclusi. Ripristina almeno un evento prima di avviare l'analisi.")
+        else:
+            n_esclusi = len(esclusi)
+            if n_esclusi > 0:
+                st.info(
+                    f"L'analisi verrà eseguita su **{len(eventi_inclusi)}** eventi ({n_esclusi} esclusi manualmente e non inviati al modello).")
 
-        with st.spinner(msg_caricamento):
-            summary_data = generate_summary(payload)
+            payload = {
+                "start": start_dt.isoformat(),
+                "end": end_dt.isoformat(),
+                "custom_prompt": user_custom_prompt if user_custom_prompt else None,
+                "selected_events": eventi_inclusi,
+            }
+            if camere_attive:
+                payload["camera_ids"] = camere_attive
 
-            if summary_data:
-                st.success("Elaborazione completata!")
+            msg_caricamento = (
+                "Ollama sta generando la sintesi standard..."
+                if not user_custom_prompt
+                else f"Ollama sta elaborando: '{user_custom_prompt}'..."
+            )
 
-                # Mostra le anomalie cronologiche solo se stiamo facendo il report standard
-                if not user_custom_prompt:
-                    anomalies = summary_data.get("anomalies", [])
-                    st.subheader("Anomalie Rilevate (Analisi Cronologica)")
-                    if anomalies:
-                        for a in anomalies:
-                            severity = a.get("severity", "MEDIA")
-                            testo_box = f"**[{a['timestamp']}] {a['camera_id']} ({a['location']})** — {a['description']}\n\n*Motivo:* {a['reason']}"
-                            if severity == "ALTA":
-                                st.error(testo_box)
-                            elif severity == "MEDIA":
-                                st.warning(testo_box)
-                            else:
-                                st.info(testo_box)
-                    else:
-                        st.success("Nessuna anomalia critica rilevata dall'algoritmo orario.")
+            with st.spinner(msg_caricamento):
+                summary_data = generate_summary(payload)
 
-                st.subheader("Risposta di Ollama")
-                st.markdown(summary_data["summary"])
+                if summary_data:
+                    st.success("Elaborazione completata!")
+                    st.subheader("Analisi di Ollama")
+                    st.markdown(summary_data["summary"])
 
 # FOOTER
 st.divider()

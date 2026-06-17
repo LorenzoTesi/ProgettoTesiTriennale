@@ -1,35 +1,21 @@
+# simulator.py — Generatore di eventi di sorveglianza simulati
 
-#simulator.py — Generatore di eventi di sorveglianza simulati
-
-# 1. Prima verifica che il backend FastAPI sia acceso:
+#verifica che il backend FastAPI sia acceso:
 #    uvicorn Ollama:app --reload
+#Personalizza il periodo e la frequenza (espressa in  un evento all'ora):
+#    python Simulator.py --stream --start 2026-04-30T06:00:00 --end 2026-04-30T23:00:00 --freq 5
 
-# 2. Salva gli eventi in un file JSON (senza inviare nulla):
-#    python simulator.py --output preview.json
-
-# 3. Invia gli eventi al backend in blocco (veloce, per test):
-#    python simulator.py --stream --interval 0
-
-# 4. Invia gli eventi lentamente, uno al secondo:
-#    python simulator.py --stream --interval 1
-
-# 5. Personalizza il periodo, la frequenza è la probabilità di generare un'anomalia:
-#    python simulator.py --stream --start 2026-04-30T06:00:00 --end 2026-04-30T23:00:00 --freq 15 --anomaly-rate 0.1
-
-#Parametri
+# Parametri
 # --start         datetime inizio simulazione  (default: oggi 06:00)
 # --end           datetime fine simulazione    (default: oggi 23:00)
-# --freq          eventi medi per ora          (default: 10)
-# --anomaly-rate  probabilità anomalia 0-1     (default: 0.08)
+# --freq          eventi medi per ora          (default: 3)
 # --stream        invia al backend invece di salvare su file
 # --interval      secondi tra un invio e l'altro in modalità stream (default: 0.2)
 # --url           URL del backend              (default: http://127.0.0.1:8000)
-# --output        file JSON di output locale   (default: events_preview.json)
 #  --check         solo verifica connessione al backend, non genera eventi
 
 
 import argparse
-import json
 import random
 import time
 import sys
@@ -37,9 +23,7 @@ from datetime import datetime, timedelta
 
 import httpx
 
-
-#Dati di riferimento
-
+# Dati con cui si compilano i campi degli eventi
 CAMERAS = {
     "corridor_1": "corridoio principale",
     "corridor_2": "corridoio secondario",
@@ -49,135 +33,131 @@ CAMERAS = {
     "exit": "uscita principale",
 }
 
-NORMAL_EVENTS = {
-    "movement": [
-        "una persona cammina per la stanza",
-        "una persona si dirige verso la porta"
-    ],
-    "idle": [
-        "persona in attesa vicino allo sportello",
-        "persona ferma al distributore automatico",
-        "dipendente in pausa",
-    ],
-    "crowd": [
-        "gruppo di persone in fila",
-        "gruppo di dipendenti a lavoro",
-    ],
+EVENT_DESCRIPTIONS = {
+    "una persona cammina lentamente per la stanza": {
+        "type": "movement",
+        "tags": ["person", "walking"]
+    },
+
+    "una persona si dirige verso la porta": {
+        "type": "movement",
+        "tags": ["person", "door"]
+    },
+
+    "una dipendente entra nella stanza": {
+        "type": "movement",
+        "tags": ["employee", "transit"]
+    },
+
+    "persona ferma al distributore automatico": {
+        "type": "idle",
+        "tags": ["person", "vending_machine"]
+    },
+
+    "dipendente in pausa": {
+        "type": "idle",
+        "tags": ["employee", "break"]
+    },
+
+    "persona ferma al cellulare": {
+        "type": "idle",
+        "tags": ["person", "phone"]
+    },
+
+    "piccolo gruppo di persone discute": {
+        "type": "crowd",
+        "tags": ["group", "discussion"]
+    },
+
+    "gruppo di dipendenti a lavoro": {
+        "type": "crowd",
+        "tags": ["group", "employee"]
+    },
+
+    "gruppo di persone stazionano davanti alla porta da oltre 10 minuti": {
+        "type": "crowd",
+        "tags": ["group", "door", "loitering"]
+    }
 }
 
-ANOMALY_EVENTS = {
-    "intrusion": [
-        "sensore rileva finestra rotta",
-        "sensore rileva la porta è stata forzata",
-    ],
-    "loitering": [
-        "gruppo di persone stazionano davanti alla porta da oltre 10 minuti"
-    ],
-    "anomaly": [
-        "movimento brusco rilevato, possibile caduta",
-        "oggetto sospetto abbandonato nell'area",
-        "emergenza medica"
-    ],
-}
 
-TAGS_MAP = {
-    "movement":  ["person", "transit"],
-    "idle":      ["person", "standing", "waiting"],
-    "crowd":     ["group", "door", "standing"],
-    "intrusion": ["unauthorized", "door", "alert"],
-    "loitering": ["group", "door", "standing", "alert"],
-    "anomaly":   ["alert", "suspicious", "object"],
-}
+# LOGICA DI GENERAZIONE
 
+def generate_single_event(ts: datetime) -> dict:
+    hour = ts.hour
+    is_night = hour >= 22 or hour < 6
 
-#LOGICA DI GENERAZIONE
-
-def expected_activity(hour: int) -> float:
-
-    if 8 <= hour < 10 or 17 <= hour < 19:
-        return 1.5
-    if 10 <= hour < 12 or 14 <= hour < 17:
-        return 1.0
-    if 12 <= hour < 14:
-        return 0.8
-    if 19 <= hour < 22:
-        return 0.3
-    return 0.05
-
-
-def generate_event(ts: datetime, anomaly_rate: float) -> dict:
-    hour     = ts.hour
-    is_night = hour >= 21 or hour < 6
-
-    # Di notte la probabilità di anomalia triplica
-    effective_rate = min(1.0, anomaly_rate * (3.0 if is_night else 1.0))
-    is_anomaly = random.random() < effective_rate
-
-    if is_anomaly:
-        event_type  = random.choice(list(ANOMALY_EVENTS.keys()))
-        description = random.choice(ANOMALY_EVENTS[event_type])
-        confidence  = round(random.uniform(0.55, 0.80), 2)
+    if is_night:
+        scelte_evento = ["movement", "idle", "crowd"]
+        pesi_evento = [0.25, 0.70, 0.05]
     else:
-        activity = expected_activity(hour)
-        if activity < 0.1:
-            event_type = "idle"
-        else:
-            event_type = random.choices(
-                ["movement", "idle", "crowd"], weights=[0.7, 0.2, 0.1]
-            )[0]
-        description = random.choice(NORMAL_EVENTS[event_type])
-        confidence  = round(random.uniform(0.82, 0.99), 2)
+        scelte_evento = ["movement", "idle", "crowd"]
+        pesi_evento = [0.70, 0.20, 0.10]
 
-    camera_id  = random.choice(list(CAMERAS.keys()))
-    base_tags  = TAGS_MAP.get(event_type, [])
-    extra_tags = random.sample(
-        ["holiday", "weekend", "peak_hour"], k=random.randint(0, 1)
+    event_type = random.choices(
+        scelte_evento,
+        weights=pesi_evento
+    )[0]
+
+    descrizioni_possibili = [
+        desc
+        for desc, info in EVENT_DESCRIPTIONS.items()
+        if info["type"] == event_type
+    ]
+
+    description = random.choice(descrizioni_possibili)
+
+    event_info = EVENT_DESCRIPTIONS[description]
+
+    camera_id = random.choice(list(CAMERAS.keys()))
+
+    base_tags = event_info["tags"]
+
+    confidence = (
+        round(random.uniform(0.55, 0.75), 2)
+        if is_night
+        else round(random.uniform(0.82, 0.99), 2)
     )
 
     return {
-        "timestamp":  ts.isoformat(timespec="seconds"),
-        "camera_id":  camera_id,
-        "location":   CAMERAS[camera_id],
+        "timestamp": ts.isoformat(timespec="seconds"),
+        "camera_id": camera_id,
+        "location": CAMERAS[camera_id],
         "description": description,
         "event_type": event_type,
         "metadata": {
             "confidence": confidence,
-            "tags":       base_tags + extra_tags,
+            "tags": base_tags,
         },
     }
 
 
 def generate_events(
-    start: datetime,
-    end: datetime,
-    freq_per_hour: float,
-    anomaly_rate: float,
+        start: datetime,
+        end: datetime,
+        freq_per_hour: float,
 ) -> list[dict]:
-    events  = []
+    events = []
     current = start
-    now     = datetime.now()
 
     while current < end:
-        hour     = current.hour
-        activity = expected_activity(hour)
-        avg_interval = 3600 / max(0.1, freq_per_hour * activity)
-        interval = random.expovariate(1.0 / avg_interval)
+        base_interval = 3600 / max(0.05, freq_per_hour)
+
+        jitter = random.uniform(0.95, 1.05)
+        interval = base_interval * jitter
+
         current += timedelta(seconds=interval)
 
         if current >= end:
             break
 
-        #se il timestamp generato è nel futuro, viene saltato
-        if current > now:
-            break
-
-        events.append(generate_event(current, anomaly_rate))
+        events.append(generate_single_event(current))
 
     return events
 
-#INVIO AL BACKEND
+# INVIO AL BACKEND
 
-#verifica che il backend FastAPI sia raggiungibile
+# verifica che il backend FastAPI sia raggiungibile
 def check_backend(url: str) -> bool:
     try:
         r = httpx.get(f"{url}/", timeout=5)
@@ -193,9 +173,9 @@ def check_backend(url: str) -> bool:
         print(f" Errore connessione: {e}")
         return False
 
-#Invia un singolo evento via POST /events. Restituisce True se ok
-def send_event(event: dict, url: str) -> bool:
 
+# Invia un singolo evento via POST /events. Restituisce True se ok
+def send_event(event: dict, url: str) -> bool:
     try:
         r = httpx.post(f"{url}/events", json=event, timeout=5)
         r.raise_for_status()
@@ -208,43 +188,39 @@ def send_event(event: dict, url: str) -> bool:
         return False
 
 
-
-#ENTRY POINT
+# ENTRY POINT
 def main():
-    #default: oggi dalle 06:00 alle 23:00
-    today        = datetime.now().strftime("%Y-%m-%d")
+    # default: oggi dalle 06:00 alle 23:00
+    today = datetime.now().strftime("%Y-%m-%d")
     default_start = f"{today}T06:00:00"
-    default_end   = f"{today}T23:00:00"
+    default_end = f"{today}T23:00:00"
 
     parser = argparse.ArgumentParser(
-        description="Generatore eventi sorveglianza",
+        description="Generatore di eventi sorveglianza",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--start",        default=default_start, help="Inizio simulazione (ISO 8601)")
-    parser.add_argument("--end",          default=default_end,   help="Fine simulazione (ISO 8601)")
-    parser.add_argument("--freq",         type=float, default=10.0,  help="Eventi medi per ora")
-    parser.add_argument("--anomaly-rate", type=float, default=0.08,  help="Probabilità anomalia 0-1")
-    parser.add_argument("--stream",       action="store_true",        help="Invia eventi al backend")
-    parser.add_argument("--interval",     type=float, default=0.2,   help="Secondi tra invii (stream)")
-    parser.add_argument("--url",          default="http://127.0.0.1:8000", help="URL backend FastAPI")
-    parser.add_argument("--output",       default="events_preview.json", help="File JSON di output locale")
-    parser.add_argument("--check",        action="store_true",        help="Solo verifica connessione backend")
+    parser.add_argument("--start", default=default_start, help="Inizio simulazione (ISO 8601)")
+    parser.add_argument("--end", default=default_end, help="Fine simulazione (ISO 8601)")
+    parser.add_argument("--freq", type=float, default=3.0, help="Eventi medi per ora")
+    parser.add_argument("--stream", action="store_true", help="Invia eventi al backend")
+    parser.add_argument("--interval", type=float, default=0.2, help="Secondi tra invii (stream)")
+    parser.add_argument("--url", default="http://127.0.0.1:8000", help="URL backend FastAPI")
+    parser.add_argument("--check", action="store_true", help="Solo verifica connessione backend")
     args = parser.parse_args()
 
     print("\n Generatore eventi")
-    print("─" * 50)
 
-    #modalità --check
+    # modalità --check
     if args.check:
         print(f"Verifica connessione a {args.url} ...")
         check_backend(args.url)
         return
 
-    #parse date
+    # parse date
     try:
         start_dt = datetime.fromisoformat(args.start)
-        end_dt   = datetime.fromisoformat(args.end)
+        end_dt = datetime.fromisoformat(args.end)
     except ValueError as e:
         print(f" Formato data non valido: {e}")
         print("    Usa il formato ISO 8601, es: 2026-04-30T06:00:00")
@@ -255,30 +231,24 @@ def main():
         sys.exit(1)
 
     print(f"   Periodo     : {start_dt}  →  {end_dt}")
-    print(f"   Frequenza   : ~{args.freq} eventi/ora  (modulata per orario)")
-    print(f"   Anomalie    : {args.anomaly_rate*100:.0f}% base  (×3 di notte)")
+    print(f"   Frequenza   : ~{args.freq} eventi/ora")
 
-    #generazione
-    events    = generate_events(start_dt, end_dt, args.freq, args.anomaly_rate)
-    anomalies = [e for e in events if e["event_type"] in ("intrusion", "loitering", "anomaly")]
+    # generazione
+    events = generate_events(start_dt, end_dt, args.freq)
 
-    print(f"\n Generati {len(events)} eventi  ({len(anomalies)} anomalie)")
+    if not events:
+        print("\n Nessun evento generato nel periodo selezionato (controlla gli orari).")
+        return
 
-    # Breakdown per tipo
-    by_type: dict[str, int] = {}
-    for e in events:
-        by_type[e["event_type"]] = by_type.get(e["event_type"], 0) + 1
-    for etype, count in sorted(by_type.items(), key=lambda x: -x[1]):
-        bar = "█" * (count * 20 // max(by_type.values()))
-        print(f"   {etype:<12} {count:>4}  {bar}")
+    print(f"\n Generati {len(events)} eventi")
 
-    #modalità STREAM (invia al backend)
+    # invio al backend
     if args.stream:
-        print(f"\n🔍  Verifica connessione a {args.url} ...")
+        print(f"\n Verifica connessione a {args.url} ...")
         if not check_backend(args.url):
             sys.exit(1)
 
-        print(f"\n Invio {len(events)} eventi → {args.url}  (intervallo: {args.interval}s)\n")
+        print(f"\n Invio {len(events)} eventi {args.url}  (intervallo: {args.interval}s)\n")
 
         ok = fail = 0
         for i, ev in enumerate(events, 1):
@@ -297,29 +267,8 @@ def main():
             if args.interval > 0:
                 time.sleep(args.interval)
 
-        print(f"\n{'─'*50}")
+        print(f"\n{'─' * 50}")
         print(f" Invio completato:  {ok} inviati   {fail} errori")
-        if fail == 0:
-            print(f"    Puoi verificare su MongoDB Atlas o chiamare:")
-            print(f"    GET {args.url}/events?start={start_dt.date()}T00:00:00&end={end_dt.date()}T23:59:59")
-
-    #modalità FILE (salva JSON locale)
-    else:
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(events, f, ensure_ascii=False, indent=2)
-
-        print(f"\n  Salvati in '{args.output}'")
-        print(f"\n Primo evento: ")
-        print(json.dumps(events[0], ensure_ascii=False, indent=2))
-        if anomalies:
-            print(f"\n Primo evento anomalo: ")
-            print(json.dumps(anomalies[0], ensure_ascii=False, indent=2))
-
-        print(f"\n Per inviare al backend:")
-        print(f"    python simulator.py --stream \\")
-        print(f"        --start {args.start} --end {args.end} \\")
-        print(f"        --freq {args.freq} --anomaly-rate {args.anomaly_rate} \\")
-        print(f"        --interval 0")
 
 
 if __name__ == "__main__":

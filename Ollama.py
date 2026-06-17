@@ -46,7 +46,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ALLOWED_EVENT_TYPES = {"movement", "intrusion", "loitering", "crowd", "anomaly", "idle"}
+ALLOWED_EVENT_TYPES = {"movement", "crowd", "idle"}
 
 CAMERAS_REGISTRY = {
     "corridor_1": "corridoio principale",
@@ -97,6 +97,14 @@ class SummaryRequest(BaseModel):
     )
     camera_ids: list[str] = Field(default_factory=list, description="Lista di camere su cui filtrare")
     custom_prompt: Optional[str] = Field(default=None, description="Prompt personalizzato opzionale dell'utente")
+    excluded_ids: list[str] = Field(
+        default_factory=list,
+        description="Lista di _id MongoDB da escludere dall'analisi LLM"
+    )
+    selected_events: list[dict] = Field(
+        default_factory=list,
+        description="Eventi già filtrati dal frontend"
+    )
 
     def resolved_end(self) -> datetime:
         if self.end is not None:
@@ -118,88 +126,6 @@ def doc_to_event(doc: dict) -> dict:
 
 def _build_time_query(start: datetime, end: datetime) -> dict:
     return {"timestamp": {"$gte": start.isoformat(), "$lte": end.isoformat()}}
-
-def _detect_anomalies(events: list[dict]) -> list[dict]:
-    anomalies = []
-    for e in events:
-        ts_str = e.get("timestamp", "")
-        try:
-            hour = int(ts_str[11:13])
-        except (ValueError, IndexError):
-            hour = 12
-
-        is_night   = hour >= 22 or hour < 6
-        is_evening = 19 <= hour < 22
-        is_day     = 8  <= hour < 19
-        etype      = e.get("event_type", "")
-
-        if etype in ("intrusion", "anomaly"):
-            label    = "ANOMALIA ESPLICITA"
-            severity = _severity(etype, is_night)
-            reason   = "Evento pericoloso indipendentemente dall'orario"
-
-        elif etype == "loitering":
-            if is_night:
-                label    = "ANOMALIA ESPLICITA"
-                severity = "ALTA"
-                reason   = "Stazionamento prolungato in orario notturno"
-            elif is_evening:
-                label    = "POTENZIALMENTE ANOMALO"
-                severity = "MEDIA"
-                reason   = "Stazionamento prolungato in orario serale"
-            else:
-                label    = "FORSE ROUTINE"
-                severity = "BASSA"
-                reason   = "Stazionamento prolungato ma in orario diurno"
-
-        elif etype == "crowd":
-            if is_night:
-                label    = "ANOMALIA CONTESTUALE"
-                severity = "MEDIA"
-                reason   = "Gruppo di persone in orario notturno"
-            elif is_evening:
-                label    = "POTENZIALMENTE ANOMALO"
-                severity = "BASSA"
-                reason   = "Gruppo di persone in orario serale"
-            elif is_day:
-                label    = "FORSE ROUTINE"
-                severity = "BASSA"
-                reason   = "Gruppo di persone in orario diurno — monitoraggio leggero"
-            else:
-                continue
-
-        elif etype in ("movement", "idle") and is_night:
-            label    = "ANOMALIA CONTESTUALE"
-            severity = "BASSA"
-            reason   = "Movimento/presenza in orario notturno inatteso"
-
-        else:
-            continue
-
-        anomalies.append({
-            "timestamp":   ts_str,
-            "camera_id":   e.get("camera_id"),
-            "location":    e.get("location"),
-            "type":        etype,
-            "label":       label,
-            "description": e.get("description"),
-            "reason":      reason,
-            "severity":    severity,
-        })
-    return anomalies
-
-
-def _severity(event_type: str, is_night: bool) -> str:
-    if event_type == "intrusion":
-        return "ALTA"
-    if event_type == "loitering":
-        return "MEDIA" if not is_night else "ALTA"
-    if event_type == "anomaly":
-        return "MEDIA"
-    if is_night:
-        return "BASSA"
-    return "BASSA"
-
 
 # MODULO LLM — OLLAMA LOCALE
 async def call_llm(prompt: str) -> str:
@@ -248,21 +174,22 @@ async def check_ollama_status() -> dict:
 
 def _build_summary_prompt(
     events: list[dict],
-    anomalies: list[dict],
     start: datetime,
     end: datetime,
     camera_ids: list[str],
 ) -> str:
 
     righe = "\n".join(
-        f"- [{e['timestamp'][11:16]}] {e['camera_id']} ({e['location']}): "
-        f"{e['description']} [tipo={e['event_type']}, confidence={e.get('metadata', {}).get('confidence', 'N/A')}]"
+        f"- [{e['timestamp'][11:16]}] "
+        f"{e['camera_id']} ({e['location']}): "
+        f"{e['description']} "
+        f"[tipo={e['event_type']}, "
+        f"tags={', '.join(e.get('metadata', {}).get('tags', []))}]"
         for e in events
     )
 
     camere_formattate = ", ".join(camera_ids) if camera_ids else "tutte"
 
-    # pre-calcola conteggi per non far contare il modello
     from collections import Counter
     by_type     = Counter(e["event_type"] for e in events)
     by_camera   = Counter(e["camera_id"]  for e in events)
@@ -283,7 +210,6 @@ Contesto operativo:
 Periodo analizzato : {start.strftime('%d/%m/%Y %H:%M')} → {end.strftime('%d/%m/%Y %H:%M')}
 Telecamere incluse : {camere_formattate}
 Totale eventi      : {len(events)}
-Anomalie rilevate  : {len(anomalies)}
 
 Criteri di normalità:
 
@@ -298,15 +224,12 @@ Fasce orarie:
   • 19:00–22:00  Fuori orario             — qualsiasi presenza è FORSE ANOMALA
   • 22:00–06:00  Orario notturno          — qualsiasi presenza è ANOMALIA CONTESTUALE o ESPLICITA
 
-Comportamenti SEMPRE ANOMALI (indipendentemente dall'orario):
-  • intrusion    : accesso non autorizzato, porta forzata, finestra rotta
-  • anomaly      : cadute, oggetti sospetti, emergenze mediche
-  • loitering    : stazionamento prolungato davanti a porte/accessi
+Significato dei tag:
 
-Comportamenti ambigui (valutare in base all'orario):
-  • crowd        : gruppo di persone — routine di giorno, sospetto di notte
-  • movement     : singola persona in movimento — routine di giorno, anomalia di notte
-  • idle         : persona ferma — routine di giorno (attesa sportello), anomala di notte
+- Il tag "employee" identifica personale autorizzato.
+- Il tag "person" identifica una persona generica non riconosciuta come dipendente.
+- Il tag "loitering" indica permanenza prolungata e richiede attenzione.
+
 
 Statistiche precalcolate:
 Per tipo evento:
@@ -323,6 +246,11 @@ Usa ESCLUSIVAMENTE queste 5 etichette:
   ANOMALIA ESPLICITA     — evento pericoloso indipendentemente dall'orario
   FORSE ROUTINE          — evento ambiguo diurno, monitoraggio leggero
   POTENZIALMENTE ANOMALO — evento ambiguo serale/notturno, richiede verifica
+
+Alcune regole di classificazione:
+
+- Una persona o un gruppo di persone presente tra le 22:00 e le 07:00 deve essere considerata ANOMALIA ESPLICITA.
+- Un dipendente o un gruppo di dipendenti presenti tra le 22:00 e le 06:00 deve essere considerato ANOMALIA CONTESTUALE.
 
 Struttura della risposta:
 
@@ -381,7 +309,6 @@ async def create_event(event: Event):
         "timestamp":  event.timestamp.isoformat(),
     }
 
-
 @app.get("/events", tags=["Eventi"])
 async def get_events(
     start: datetime = Query(..., description="Inizio intervallo"),
@@ -389,8 +316,7 @@ async def get_events(
     camera_ids: Optional[list[str]] = Query(None, description="Filtra per una o più camere"),
     event_type: Optional[str] = Query(None, description="Filtra per tipo di evento"),
     location: Optional[str] = Query(None, description="Parola chiave nella location"),
-    keyword: Optional[str] = Query(None, description="Parola chiave nella descrizione"),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(100, ge=0, le=1000),
 ):
     if end <= start:
         raise HTTPException(status_code=400, detail="'end' deve essere successivo a 'start'")
@@ -406,18 +332,22 @@ async def get_events(
         query["event_type"] = event_type
     if location:
         query["location"] = {"$regex": location, "$options": "i"}
-    if keyword:
-        query["description"] = {"$regex": keyword, "$options": "i"}
 
-    cursor = collection.find(query).sort("timestamp", 1).limit(limit)
+    cursor = collection.find(query).sort("timestamp", 1)
+
+    if limit > 0:
+        cursor = cursor.limit(limit)
+
     events = [doc_to_event(doc) async for doc in cursor]
 
     return {
         "count": len(events),
         "filters": {
-            "start": start.isoformat(), "end": end.isoformat(),
-            "camera_ids": camera_ids, "event_type": event_type,
-            "location": location, "keyword": keyword,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "camera_ids": camera_ids,
+            "event_type": event_type,
+            "location": location,
         },
         "events": events,
     }
@@ -493,7 +423,6 @@ async def get_stats(
     return {
         "period": {"start": start.isoformat(), "end": end.isoformat()},
         "total_events": len(events),
-        "anomaly_count": len(_detect_anomalies(events)),
         "by_event_type": by_type,
         "by_camera": by_camera,
     }
@@ -512,8 +441,11 @@ async def generate_summary(req: SummaryRequest):
     if req.camera_ids:
         query["camera_id"] = {"$in": req.camera_ids}
 
-    cursor = collection.find(query).sort("timestamp", 1)
-    events = [doc_to_event(doc) async for doc in cursor]
+    if req.selected_events:
+        events = req.selected_events
+    else:
+        cursor = collection.find(query).sort("timestamp", 1)
+        events = [doc_to_event(doc) async for doc in cursor]
 
     if not events:
         raise HTTPException(
@@ -524,8 +456,6 @@ async def generate_summary(req: SummaryRequest):
             ),
         )
 
-    anomalies = _detect_anomalies(events)
-
     if req.custom_prompt and req.custom_prompt.strip():
         righe_eventi = "\n".join(
             f"- [{e['timestamp'][11:16]}] Camera: {e['camera_id']} ({e['location']}) | Tipo: {e['event_type']} | Descrizione: {e['description']}"
@@ -533,19 +463,19 @@ async def generate_summary(req: SummaryRequest):
         )
         prompt = (
             f"Sei un sistema di intelligenza artificiale per la sicurezza.\n"
-            f"Il tuo compito è leggere attentamente la lista degli eventi grezzi riportata sotto, "
+            f"Il tuo compito è leggere attentamente la lista degli eventi riportata sotto, "
             f"comprenderne il significato e rispondere alla richiesta dell'operatore in modo diretto, preciso e conciso.\n"
-            f"Se la richiesta implica un conteggio (es. 'quanti...'), analizza i testi, conta gli elementi corrispondenti e fornisci il risultato numerico spiegando brevemente il perché.\n"
+            f"Se la richiesta implica un conteggio (es. 'quanti...'), analizza i testi, conta gli elementi corrispondenti e fornisci il risultato numerico.\n"
             f"Rispondi in italiano e non ripetere l'intera lista degli eventi nella risposta.\n\n"
             f"RICHIESTA OPERATORE: {req.custom_prompt}\n\n"
             f"LISTA DEGLI EVENTI DA ANALIZZARE ({len(events)} totali):\n{righe_eventi}\n\n"
             f"RISPOSTA DELL'ASSISTENTE AI:"
         )
     else:
-        # Se non c'è un prompt personalizzato, usa il report standard
-        prompt = _build_summary_prompt(events, anomalies, req.start, end, req.camera_ids)
+        prompt = _build_summary_prompt(events, req.start, end, req.camera_ids)
+
     sintesi = await call_llm(prompt)
-#TODO STA ROBA CI METE UNA MAREA E RISPONDE CON LA SINTESI STANDARD
+
     if req.custom_prompt and req.custom_prompt.strip():
         return {"summary": sintesi}
 
@@ -555,7 +485,5 @@ async def generate_summary(req: SummaryRequest):
         "camera_ids": req.camera_ids,
         "llm_backend": f"Ollama ({OLLAMA_MODEL}) @ {OLLAMA_BASE_URL}",
         "total_events": len(events),
-        "anomaly_count": len(anomalies),
-        "anomalies": anomalies,
         "summary": sintesi,
     }
