@@ -1,7 +1,7 @@
 # simulator.py — Generatore di eventi di sorveglianza simulati
 
 #verifica che il backend FastAPI sia acceso:
-#    uvicorn Ollama:app --reload
+#    uvicorn backend:app --reload
 #Personalizza il periodo e la frequenza (espressa in  un evento all'ora):
 #    python Simulator.py --stream --start 2026-04-30T06:00:00 --end 2026-04-30T23:00:00 --freq 5
 
@@ -20,7 +20,6 @@ import random
 import time
 import sys
 from datetime import datetime, timedelta
-
 import httpx
 
 # Dati con cui si compilano i campi degli eventi

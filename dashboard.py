@@ -7,7 +7,7 @@
 # streamlit run dashboard.py
 #
 # Assicurarsi che il backend FastAPI sia acceso:
-# uvicorn ollama:app --reload
+# uvicorn backend:app --reload
 
 import streamlit as st
 import requests
@@ -134,7 +134,7 @@ opzioni_limite = {
 limite_selezionato = st.sidebar.selectbox(
     "Numero massimo eventi",
     options=list(opzioni_limite.keys()),
-    index=3  # Imposta di default "100 eventi" (la quarta opzione, indice 3)
+    index=3  # Imposta di default "100 eventi"
 )
 limit = opzioni_limite[limite_selezionato]
 
@@ -142,7 +142,6 @@ load_button = st.sidebar.button("Carica eventi")
 
 # Prende la lista di tutte le camere che sono attive
 camere_attive = [cam_id for cam_id, active in st.session_state.camera_status.items() if active]
-all_cameras = list(st.session_state.camera_status.keys())
 
 params = {
     "start": start_dt.isoformat(),
@@ -195,11 +194,9 @@ with tab_dashboard:
 
             stats = st.session_state.loaded_stats
             if stats:
-                col1, col2 = st.columns(2)
+                col1, _ = st.columns(2)
                 with col1:
-                    st.metric("Totale eventi", stats["total_events"])
-                with col2:
-                    st.metric("Camere attive", len(stats["by_camera"]))
+                    st.metric("Totale eventi recuperati", stats["total_events"])
 
             n_esclusi = len(st.session_state.excluded_events)
             st.subheader("Lista eventi")
@@ -258,7 +255,7 @@ with tab_dashboard:
 
 # Tab 2: Logica generativa (Ollama)
 with tab_intelligenza_art:
-    st.subheader("Analisi Semantica con LLM Locale")
+    st.subheader("Analisi degli eventi con LLM locale")
     st.write("Fai una richiesta personalizzata oppure clicca il tasto per una sintesi.")
 
     tasto_standard = st.button("Avvia Elaborazione Sintesi Standard")

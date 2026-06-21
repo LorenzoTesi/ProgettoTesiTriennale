@@ -128,7 +128,9 @@ def _build_time_query(start: datetime, end: datetime) -> dict:
     return {"timestamp": {"$gte": start.isoformat(), "$lte": end.isoformat()}}
 
 # MODULO LLM — OLLAMA LOCALE
-async def call_llm(prompt: str) -> str:
+async def call_llm(prompt: str, n_events: int = 0) -> str:
+
+    output_tokens = max(1024, n_events * 60 + 512)
     url = f"{OLLAMA_BASE_URL}/api/generate"
     payload = {
         "model":  OLLAMA_MODEL,
@@ -136,7 +138,8 @@ async def call_llm(prompt: str) -> str:
         "stream": False,
         "options": {
             "temperature": 0.3,
-            "num_predict": 1024,
+            "num_predict": 4096,
+            "num_ctx": 8192,
         },
     }
 
@@ -178,100 +181,65 @@ def _build_summary_prompt(
     end: datetime,
     camera_ids: list[str],
 ) -> str:
+    righe = []
+    for e in events:
+        tags = e.get("metadata", {}).get("tags", [])
+        soggetto = "dipendente autorizzato" if "employee" in tags else "persona non autorizzata"
+        ora = e["timestamp"][11:16]
+        righe.append(
+            f"[{ora}] {e['camera_id']} ({e['location']}) | {e['description']} | soggetto:{soggetto}"
+        )
+    eventi_txt = "\n".join(righe)
+    camere = ", ".join(camera_ids) if camera_ids else "tutte"
+    return f"""Sei un sistema di analisi della sicurezza per una struttura bancaria. Il tuo compito è classificare ogni evento osservato tenendo conto dell'orario, del luogo e del tipo di soggetto.
 
-    righe = "\n".join(
-        f"- [{e['timestamp'][11:16]}] "
-        f"{e['camera_id']} ({e['location']}): "
-        f"{e['description']} "
-        f"[tipo={e['event_type']}, "
-        f"tags={', '.join(e.get('metadata', {}).get('tags', []))}]"
-        for e in events
-    )
+FASCE ORARIE DELLA STRUTTURA:
+  06:00–08:00  Pre-apertura       (struttura chiusa, solo personale autorizzato)
+  08:00–19:00  Orario operativo   (presenza di dipendenti e clienti è normale)
+  19:00–22:00  Fuori orario       (struttura chiusa al pubblico, i dipendenti possono restare)
+  22:00–06:00  Orario notturno    (struttura vuota, qualsiasi presenza è sospetta)
 
-    camere_formattate = ", ".join(camera_ids) if camera_ids else "tutte"
+CRITERI DI NORMALITÀ (ragiona sempre combinando orario + luogo + soggetto):
+  - In orario di lavoro (08:00-19:00) camminare, sostare, discutere sono comportamenti ordinari per qualsiasi soggetto.
+  - Fuori orario (19:00-22:00) i dipendenti possono ancora trovarsi nella struttura, ma gli altri soggetti no.
+  - Di notte (22:00-06:00) qualsiasi presenza umana è insolita e va segnalata, la presenza soggetti che non sono dipendenti è ancora più grave.
+  - La camera blindata (vault) è accessibile solo ai dipendenti in qualsiasi orario, la presenza di altri soggetti nella camera blindata è una grave violazione di sicurezza durante qualsiasi orario.
 
-    from collections import Counter
-    by_type     = Counter(e["event_type"] for e in events)
-    by_camera   = Counter(e["camera_id"]  for e in events)
-    stats_block = "\n".join(
-        f"  - {k}: {v} eventi" for k, v in sorted(by_type.items(), key=lambda x: -x[1])
-    )
-    camera_block = "\n".join(
-        f"  - {k} ({CAMERAS_REGISTRY.get(k, k)}): {v} eventi"
-        for k, v in sorted(by_camera.items(), key=lambda x: -x[1])
-    )
+CATEGORIE DI CLASSIFICAZIONE:
+  ANOMALIA ESPLICITA     — evento pericoloso per natura o per violazione di regolamenti (es presenza di persone non autorizzate nella struttura dopo la chiusura)
+  ANOMALIA CONTESTUALE   — comportamento innocuo ma l'orario lo rende sospetto (es. dipendente presente in tarda notte)
+  POTENZIALMENTE ANOMALO — situazione ambigua in orario serale/notturno, richiede verifica
+  FORSE ROUTINE          — comportamento leggermente insolito ma plausibile, monitoraggio leggero
+  ROUTINE                — evento del tutto atteso per orario, luogo e tipo di soggetto
 
-    return f"""Sei un sistema adibito all'analisi della sicurezza.
-Il tuo compito è analizzare gli eventi osservati e classificarli distinguendo
-routine, anomalie contestuali e anomalie esplicite.
+REGOLE DI OUTPUT OBBLIGATORIE:
+  - Ogni evento appare UNA SOLA VOLTA nella sezione più appropriata. È vietato ripetere lo stesso evento in più sezioni.
+  - Il formato di ogni riga è ESATTAMENTE: [HH:MM] <camera> (<location>) — <descrizione> | Motivo: <la tua spiegazione>
+  - Non aggiungere il tipo di soggetto nella riga di output. Il soggetto è un dato interno per la classificazione.
 
-Contesto operativo:
+Periodo analizzato: {start.strftime('%d/%m/%Y %H:%M')} → {end.strftime('%d/%m/%Y %H:%M')} | Camere: {camere}
 
-Periodo analizzato : {start.strftime('%d/%m/%Y %H:%M')} → {end.strftime('%d/%m/%Y %H:%M')}
-Telecamere incluse : {camere_formattate}
-Totale eventi      : {len(events)}
+EVENTI DA CLASSIFICARE ({len(events)}):
+{eventi_txt}
 
-Criteri di normalità:
+Rispondi in italiano con questa ESATTA struttura. Se una sezione non ha eventi scrivi "Nessun evento".
 
-Il sistema monitora un ambiente con il seguente comportamento atteso:
+Riepilogo: <sintesi in 1-2 righe del periodo osservato>
 
-Fasce orarie:
-  • 08:00–10:00  Alta affluenza (apertura) — movimento e crowd sono ROUTINE
-  • 10:00–12:00  Attività normale         — movement/idle/crowd sono ROUTINE
-  • 12:00–14:00  Pausa pranzo             — attività ridotta, idle frequente è ROUTINE
-  • 14:00–17:00  Attività normale         — movement/idle/crowd sono ROUTINE
-  • 17:00–19:00  Alta affluenza (chiusura)— movement e crowd sono ROUTINE
-  • 19:00–22:00  Fuori orario             — qualsiasi presenza è FORSE ANOMALA
-  • 22:00–06:00  Orario notturno          — qualsiasi presenza è ANOMALIA CONTESTUALE o ESPLICITA
+### ANOMALIA ESPLICITA
+- [HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega perché è una violazione>
 
-Significato dei tag:
+### ANOMALIA CONTESTUALE
+- [HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega il contrasto orario/comportamento>
 
-- Il tag "employee" identifica personale autorizzato.
-- Il tag "person" identifica una persona generica non riconosciuta come dipendente.
-- Il tag "loitering" indica permanenza prolungata e richiede attenzione.
+### POTENZIALMENTE ANOMALO
+- [HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega l'ambiguità>
 
+### FORSE ROUTINE
+- [HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega perché è plausibile>
 
-Statistiche precalcolate:
-Per tipo evento:
-{stats_block}
-
-Per telecamera:
-{camera_block}
-
-Classificazione da usare:
-
-Usa ESCLUSIVAMENTE queste 5 etichette:
-  ROUTINE                — evento atteso per orario e contesto
-  ANOMALIA CONTESTUALE   — evento innocuo ma sospetto per l'orario
-  ANOMALIA ESPLICITA     — evento pericoloso indipendentemente dall'orario
-  FORSE ROUTINE          — evento ambiguo diurno, monitoraggio leggero
-  POTENZIALMENTE ANOMALO — evento ambiguo serale/notturno, richiede verifica
-
-Alcune regole di classificazione:
-
-- Una persona o un gruppo di persone presente tra le 22:00 e le 07:00 deve essere considerata ANOMALIA ESPLICITA.
-- Un dipendente o un gruppo di dipendenti presenti tra le 22:00 e le 06:00 deve essere considerato ANOMALIA CONTESTUALE.
-
-Struttura della risposta:
-
-1. Riepilogo Generale:
-   Sintesi in 3-4 righe del periodo osservato.
-
-2. Classificazione eventi:
-   [HH:MM] <camera> (<location>) — <descrizione>
-   → Etichetta | Gravità: ALTA/MEDIA/BASSA | Motivo: <spiegazione>
-
-3. Pattern rilevati:
-   Tendenze ricorrenti, orari critici, camere più attive.
-
-4. Raccomandazioni operative:
-   Azioni suggerite basate sulle anomalie rilevate.
-
-Eventi da classificare ({len(events)} totali)
-{righe}
-
-Rispondi in italiano. Sii preciso e conciso."""
-
+### ROUTINE
+- [HH:MM] <camera> (<location>) | <descrizione> | Motivo: <conferma normalità>"""
 
 @app.get("/", tags=["Sistema"])
 def home():
@@ -282,7 +250,6 @@ def home():
         "ollama_model": OLLAMA_MODEL,
         "docs": "/docs",
     }
-
 
 @app.get("/llm/status", tags=["Sistema"])
 async def llm_status():
@@ -469,12 +436,11 @@ async def generate_summary(req: SummaryRequest):
             f"Rispondi in italiano e non ripetere l'intera lista degli eventi nella risposta.\n\n"
             f"RICHIESTA OPERATORE: {req.custom_prompt}\n\n"
             f"LISTA DEGLI EVENTI DA ANALIZZARE ({len(events)} totali):\n{righe_eventi}\n\n"
-            f"RISPOSTA DELL'ASSISTENTE AI:"
         )
     else:
         prompt = _build_summary_prompt(events, req.start, end, req.camera_ids)
 
-    sintesi = await call_llm(prompt)
+    sintesi = await call_llm(prompt, n_events=len(events))
 
     if req.custom_prompt and req.custom_prompt.strip():
         return {"summary": sintesi}
