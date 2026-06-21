@@ -57,6 +57,26 @@ CAMERAS_REGISTRY = {
     "exit": "uscita principale",
 }
 
+_MAPPA_TELECAMERE_TXT = "\n".join(f"  - {k}: {v}" for k, v in CAMERAS_REGISTRY.items())
+
+CONTESTO_STRUTTURA = f"""CONTESTO DELLA STRUTTURA:
+
+TELECAMERE E MAPPA DELLE ZONE:
+{_MAPPA_TELECAMERE_TXT}
+
+FASCE ORARIE DELLA STRUTTURA:
+  06:00–08:00  Pre-apertura       (struttura chiusa, solo personale autorizzato)
+  08:00–19:00  Orario operativo   (presenza di dipendenti e clienti è normale)
+  19:00–22:00  Fuori orario       (struttura chiusa al pubblico, i dipendenti possono restare)
+  22:00–06:00  Orario notturno    (struttura vuota, qualsiasi presenza è sospetta)
+
+CRITERI DI SICUREZZA E NORMALITÀ:
+  - In orario di pre-apertura (06:00-08:00) la struttura è chiusa al pubblico e solo i dipendenti possono essere presenti.
+  - In orario di lavoro (08:00-19:00) persone che camminano, discutono o sostano nella struttura sono comportamenti completamente ordinari.
+  - Fuori orario (19:00-22:00) i dipendenti possono ancora trovarsi nella struttura, ma la presenza di soggetti non autorizzati è una violazione di sicurezza.
+  - Di notte (22:00-06:00) qualsiasi presenza umana è insolita e va segnalata; la presenza di soggetti che non sono dipendenti è una ancora più grave violazione di sicurezza.
+  - Per regolamento la camera blindata (vault) è accessibile solo ai dipendenti in qualsiasi orario. La presenza di altri soggetti nella camera blindata è una gravissima violazione di sicurezza durante qualsiasi orario e va sempre riportata come tale."""
+
 # SCHEMI PYDANTIC
 class EventMetadata(BaseModel):
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
@@ -184,45 +204,31 @@ def _build_summary_prompt(
     righe = []
     for e in events:
         tags = e.get("metadata", {}).get("tags", [])
-        soggetto = "dipendente autorizzato" if "employee" in tags else "persona non autorizzata"
-        ora = e["timestamp"][11:16]
+        soggetto = "dipendente autorizzato" if "employee" in tags else "persona esterna non autorizzata"
+        ts = e["timestamp"]
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        ora = ts.strftime("%H:%M")
         righe.append(
             f"[{ora}] {e['camera_id']} ({e['location']}) | {e['description']} | soggetto:{soggetto}"
         )
     eventi_txt = "\n".join(righe)
-    camere = ", ".join(camera_ids) if camera_ids else "tutte"
+
     return f"""Sei un sistema di analisi della sicurezza per una struttura bancaria. Il tuo compito è classificare ogni evento osservato tenendo conto dell'orario, del luogo e del tipo di soggetto.
 
-FASCE ORARIE DELLA STRUTTURA:
-  06:00–08:00  Pre-apertura       (struttura chiusa, solo personale autorizzato)
-  08:00–19:00  Orario operativo   (presenza di dipendenti e clienti è normale)
-  19:00–22:00  Fuori orario       (struttura chiusa al pubblico, i dipendenti possono restare)
-  22:00–06:00  Orario notturno    (struttura vuota, qualsiasi presenza è sospetta)
-
-CRITERI DI NORMALITÀ (ragiona sempre combinando orario + luogo + soggetto):
-  - In orario di lavoro (08:00-19:00) camminare, sostare, discutere sono comportamenti ordinari per qualsiasi soggetto.
-  - Fuori orario (19:00-22:00) i dipendenti possono ancora trovarsi nella struttura, ma gli altri soggetti no.
-  - Di notte (22:00-06:00) qualsiasi presenza umana è insolita e va segnalata, la presenza soggetti che non sono dipendenti è ancora più grave.
-  - La camera blindata (vault) è accessibile solo ai dipendenti in qualsiasi orario, la presenza di altri soggetti nella camera blindata è una grave violazione di sicurezza durante qualsiasi orario.
-
-CATEGORIE DI CLASSIFICAZIONE:
-  ANOMALIA ESPLICITA     — evento pericoloso per natura o per violazione di regolamenti (es presenza di persone non autorizzate nella struttura dopo la chiusura)
-  ANOMALIA CONTESTUALE   — comportamento innocuo ma l'orario lo rende sospetto (es. dipendente presente in tarda notte)
-  POTENZIALMENTE ANOMALO — situazione ambigua in orario serale/notturno, richiede verifica
-  FORSE ROUTINE          — comportamento leggermente insolito ma plausibile, monitoraggio leggero
-  ROUTINE                — evento del tutto atteso per orario, luogo e tipo di soggetto
+{CONTESTO_STRUTTURA}
 
 REGOLE DI OUTPUT OBBLIGATORIE:
   - Ogni evento appare UNA SOLA VOLTA nella sezione più appropriata. È vietato ripetere lo stesso evento in più sezioni.
-  - Il formato di ogni riga è ESATTAMENTE: [HH:MM] <camera> (<location>) — <descrizione> | Motivo: <la tua spiegazione>
+  - Il formato di ogni riga è ESATTAMENTE: [HH:MM] <camera> (<location>) | <descrizione> | Motivo: <la tua spiegazione>
   - Non aggiungere il tipo di soggetto nella riga di output. Il soggetto è un dato interno per la classificazione.
 
-Periodo analizzato: {start.strftime('%d/%m/%Y %H:%M')} → {end.strftime('%d/%m/%Y %H:%M')} | Camere: {camere}
+Periodo analizzato: {start.strftime('%d/%m/%Y %H:%M')} → {end.strftime('%d/%m/%Y %H:%M')}
 
 EVENTI DA CLASSIFICARE ({len(events)}):
 {eventi_txt}
 
-Rispondi in italiano con questa ESATTA struttura. Se una sezione non ha eventi scrivi "Nessun evento".
+Rispondi in italiano con questa ESATTA struttura. Se una sezione non ha eventi IGNORALA.
 
 Riepilogo: <sintesi in 1-2 righe del periodo osservato>
 
@@ -424,16 +430,25 @@ async def generate_summary(req: SummaryRequest):
         )
 
     if req.custom_prompt and req.custom_prompt.strip():
-        righe_eventi = "\n".join(
-            f"- [{e['timestamp'][11:16]}] Camera: {e['camera_id']} ({e['location']}) | Tipo: {e['event_type']} | Descrizione: {e['description']}"
-            for e in events
-        )
+        righe_lista = []
+        for e in events:
+            tags = e.get("metadata", {}).get("tags", [])
+            soggetto = "dipendente autorizzato" if "employee" in tags else "persona non autorizzata"
+            ts = e["timestamp"]
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            ora = ts.strftime("%H:%M")
+            righe_lista.append(
+                f"- [{ora}] Camera: {e['camera_id']} ({e['location']}) | Tipo: {e['event_type']} | Soggetto: {soggetto} | Descrizione: {e['description']}"
+            )
+        righe_eventi = "\n".join(righe_lista)
         prompt = (
-            f"Sei un sistema di intelligenza artificiale per la sicurezza.\n"
-            f"Il tuo compito è leggere attentamente la lista degli eventi riportata sotto, "
-            f"comprenderne il significato e rispondere alla richiesta dell'operatore in modo diretto, preciso e conciso.\n"
-            f"Se la richiesta implica un conteggio (es. 'quanti...'), analizza i testi, conta gli elementi corrispondenti e fornisci il risultato numerico.\n"
-            f"Rispondi in italiano e non ripetere l'intera lista degli eventi nella risposta.\n\n"
+            f"Sei un sistema di intelligenza artificiale per la sicurezza. Il tuo compito è leggere attentamente la lista degli eventi riportata sotto, "
+            f"comprenderne il significato e rispondere alla richiesta dell'operatore in modo diretto, preciso e conciso.\n\n"
+            f"{CONTESTO_STRUTTURA}\n\n"
+            f"ISTRUZIONI ADDIZIONALI:\n"
+            f"- Se la richiesta implica un conteggio (es. 'quanti...'), analizza i testi, conta gli elementi corrispondenti e fornisci il risultato numerico.\n"
+            f"- Rispondi in italiano e non ripetere l'intera lista degli eventi nella risposta.\n\n"
             f"RICHIESTA OPERATORE: {req.custom_prompt}\n\n"
             f"LISTA DEGLI EVENTI DA ANALIZZARE ({len(events)} totali):\n{righe_eventi}\n\n"
         )

@@ -3,7 +3,7 @@
 #verifica che il backend FastAPI sia acceso:
 #    uvicorn backend:app --reload
 #Personalizza il periodo e la frequenza (espressa in  un evento all'ora):
-#    python Simulator.py --stream --start 2026-04-30T06:00:00 --end 2026-04-30T23:00:00 --freq 5
+#    python Simulator.py --stream --start 2026-04-30T06:00:00 --end 2026-04-30T23:00:00 --freq 3
 
 # Parametri
 # --start         datetime inizio simulazione  (default: oggi 06:00)
