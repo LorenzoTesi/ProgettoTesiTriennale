@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  # 1. DATABASE MongoDB
+  mongodb:
+    image: mongo:latest
+    container_name: sorveglianza_mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - rete_sorveglianza
+
+  # 2. BACKEND (FastAPI)
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: sorveglianza_api
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGO_DETAILS=mongodb://mongodb:27017/sistema_eventi
+      - OLLAMA_BASE_URL=http://ollama:11434
+    depends_on:
+      - mongodb
+    networks:
+      - rete_sorveglianza
+
+  # 3. DASHBOARD FRONTEND (Streamlit)
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: sorveglianza_frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - API_BASE_URL=http://api:8000
+    depends_on:
+      - api
+    networks:
+      - rete_sorveglianza
+
+  # 4. LLM LOCALE (Ollama)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: sorveglianza_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_storage:/root/.ollama
+    networks:
+      - rete_sorveglianza
+
+networks:
+  rete_sorveglianza:
+    driver: bridge
+
+volumes:
+  mongo_data:
+  ollama_storage:
