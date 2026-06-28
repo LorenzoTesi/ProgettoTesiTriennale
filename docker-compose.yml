@@ -21,8 +21,8 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - MONGO_DETAILS=mongodb://mongodb:27017/sistema_eventi
-      - OLLAMA_BASE_URL=http://ollama:11434
+    - MONGO_DETAILS=mongodb+srv://lorenzotesi:Zekrom03!@progettotesi.eyjcybv.mongodb.net/?appName=ProgettoTesi
+    - OLLAMA_BASE_URL=http://ollama:11434
     depends_on:
       - mongodb
     networks:

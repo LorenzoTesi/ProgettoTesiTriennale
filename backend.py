@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-from datetime import datetime
+from datetime import datetime, timedelta, time
 from typing import Optional
 from contextlib import asynccontextmanager
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -143,9 +143,46 @@ def doc_to_event(doc: dict) -> dict:
     doc["_id"] = str(doc["_id"])
     return doc
 
-
 def _build_time_query(start: datetime, end: datetime) -> dict:
-    return {"timestamp": {"$gte": start.isoformat(), "$lte": end.isoformat()}}
+    start_time = start.time()
+    end_time = end.time()
+
+    current_day = start.date()
+    last_day = end.date()
+
+    clauses = []
+
+    while current_day <= last_day:
+
+        window_start = datetime.combine(current_day, start_time)
+
+        if end_time >= start_time:
+            # stessa giornata
+            window_end = datetime.combine(current_day, end_time)
+
+        elif current_day < last_day:
+            # attraversa la mezzanotte
+            window_end = datetime.combine(
+                current_day + timedelta(days=1),
+                end_time
+            )
+        else:
+
+            window_end = datetime.combine(
+                current_day,
+                time(23, 59, 59, 999999)
+            )
+
+        clauses.append({
+            "timestamp": {
+                "$gte": window_start.isoformat(),
+                "$lte": window_end.isoformat()
+            }
+        })
+
+        current_day += timedelta(days=1)
+
+    return {"$or": clauses}
 
 # MODULO LLM — OLLAMA LOCALE
 async def call_llm(prompt: str, n_events: int = 0) -> str:
@@ -294,18 +331,28 @@ async def get_events(
     if end <= start:
         raise HTTPException(status_code=400, detail="'end' deve essere successivo a 'start'")
 
-    query: dict = _build_time_query(start, end)
+    conditions=[_build_time_query(start,end)]
 
     if camera_ids:
-        query["camera_id"] = {"$in": camera_ids}
-
+        conditions.append({
+        "camera_id": {"$in": camera_ids}
+        })
     if event_type:
         if event_type not in ALLOWED_EVENT_TYPES:
             raise HTTPException(status_code=400, detail=f"event_type non valido: {ALLOWED_EVENT_TYPES}")
-        query["event_type"] = event_type
-    if location:
-        query["location"] = {"$regex": location, "$options": "i"}
 
+        conditions.append({
+            "event_type": event_type
+        })
+
+    if location:
+        conditions.append({
+            "location": {
+                "$regex": location,
+                "$options": "i"
+            }
+        })
+    query = {"$and": conditions}
     cursor = collection.find(query).sort("timestamp", 1)
 
     if limit > 0:
