@@ -251,7 +251,7 @@ with tab_dashboard:
         else:
             st.warning("Nessun evento trovato per i criteri o per le telecamere selezionate.")
     else:
-        st.info("💡 Imposta i filtri nella barra laterale a sinistra e clicca su 'Carica eventi'.")
+        st.info("Imposta i filtri nella barra laterale a sinistra e clicca su 'Carica eventi'.")
 
 # Tab 2: Logica generativa (Ollama)
 with tab_intelligenza_art:

@@ -65,23 +65,22 @@ TELECAMERE E MAPPA DELLE ZONE:
 {_MAPPA_TELECAMERE_TXT}
 
 FASCE ORARIE DELLA STRUTTURA:
-  06:00–08:00  Pre-apertura       (struttura chiusa, solo personale autorizzato)
-  08:00–19:00  Orario operativo   (presenza di dipendenti e clienti è normale)
-  19:00–22:00  Fuori orario       (struttura chiusa al pubblico, i dipendenti possono restare)
-  22:00–06:00  Orario notturno    (struttura vuota, qualsiasi presenza è sospetta)
+  06:00–08:00  Pre-apertura       
+  08:00–19:00  Orario operativo   
+  19:00–22:00  Fuori orario
+  22:00–06:00  Orario notturno
 
 CRITERI DI SICUREZZA E NORMALITÀ:
-  - In orario di pre-apertura (06:00-08:00) la struttura è chiusa al pubblico e solo i dipendenti possono essere presenti.
-  - In orario di lavoro (08:00-19:00) persone che camminano, discutono o sostano nella struttura sono comportamenti completamente ordinari.
-  - Fuori orario (19:00-22:00) i dipendenti possono ancora trovarsi nella struttura, ma la presenza di soggetti non autorizzati è una violazione di sicurezza.
-  - Di notte (22:00-06:00) qualsiasi presenza umana è insolita e va segnalata; la presenza di soggetti che non sono dipendenti è una ancora più grave violazione di sicurezza.
-  - Per regolamento la camera blindata (vault) è accessibile solo ai dipendenti in qualsiasi orario. La presenza di altri soggetti nella camera blindata è una gravissima violazione di sicurezza durante qualsiasi orario e va sempre riportata come tale."""
+  - In orario di pre-apertura (06:00-08:00) la struttura è chiusa al pubblico e solo i dipendenti devono essere presenti.
+  - In orario operativo (08:00-19:00) persone che camminano, discutono o sostano nella struttura sono comportamenti completamente ordinari.
+  - Fuori orario (19:00-22:00) i dipendenti possono ancora trovarsi nella struttura, ma la presenza di soggetti non autorizzati è una GRAVE VIOLAZIONE DI SICUREZZA.
+  - Di notte (22:00-06:00) qualsiasi presenza umana è quantomeno insolita e va segnalata.
+  - Per regolamento la camera blindata (vault) è accessibile solo ai dipendenti in qualsiasi orario. La presenza di altri soggetti nella camera blindata è una GRAVISSIMA VIOLAZIONE DI SICUREZZA durante qualsiasi orario e va sempre riportata come tale."""
 
 # SCHEMI PYDANTIC
 class EventMetadata(BaseModel):
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     tags: list[str]   = Field(default_factory=list)
-
 
 class Event(BaseModel):
     timestamp:   datetime     = Field(description="Data e ora dell'evento (Formato ISO 8601)")
@@ -187,16 +186,23 @@ def _build_time_query(start: datetime, end: datetime) -> dict:
 # MODULO LLM — OLLAMA LOCALE
 async def call_llm(prompt: str, n_events: int = 0) -> str:
 
-    output_tokens = max(1024, n_events * 60 + 512)
+    output_tokens = max(2048, n_events * 80 + 1024)
+    prompt_tokens_estimate = max(2048, len(prompt) // 4)
+    num_ctx = int((prompt_tokens_estimate + output_tokens) * 1.2)
+    ctx_power2 = 1
+    while ctx_power2 < num_ctx:
+        ctx_power2 *= 2
+    num_ctx = min(ctx_power2, 65536)
+
     url = f"{OLLAMA_BASE_URL}/api/generate"
     payload = {
         "model":  OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.3,
-            "num_predict": 4096,
-            "num_ctx": 8192,
+            "temperature": 0.1,
+            "num_predict": output_tokens,
+            "num_ctx": num_ctx,
         },
     }
 
@@ -245,44 +251,58 @@ def _build_summary_prompt(
         ts = e["timestamp"]
         if isinstance(ts, str):
             ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        ora = ts.strftime("%H:%M")
+        data_ora = ts.strftime("%d/%m/%Y %H:%M")
         righe.append(
-            f"[{ora}] {e['camera_id']} ({e['location']}) | {e['description']} | soggetto:{soggetto}"
+            f"[{data_ora}] {e['camera_id']} ({e['location']}) | {e['description']} | soggetto:{soggetto}"
         )
     eventi_txt = "\n".join(righe)
+    n = len(events)
 
     return f"""Sei un sistema di analisi della sicurezza per una struttura bancaria. Il tuo compito è classificare ogni evento osservato tenendo conto dell'orario, del luogo e del tipo di soggetto.
 
 {CONTESTO_STRUTTURA}
 
-REGOLE DI OUTPUT OBBLIGATORIE:
-  - Ogni evento appare UNA SOLA VOLTA nella sezione più appropriata. È vietato ripetere lo stesso evento in più sezioni.
-  - Il formato di ogni riga è ESATTAMENTE: [HH:MM] <camera> (<location>) | <descrizione> | Motivo: <la tua spiegazione>
-  - Non aggiungere il tipo di soggetto nella riga di output. Il soggetto è un dato interno per la classificazione.
+GUIDA ALLE CATEGORIE (usala per assegnare ogni evento):
+  ANOMALIA ESPLICITA      → GRAVE VIOLAZIONE DELLE REGOLE.
+  ANOMALIA CONTESTUALE    → evento apparentemente grave ma giustificabile in base a orario, zona o soggetto.
+  POTENZIALMENTE ANOMALO  → ambiguo: potrebbe essere normale o sospetto, richiede attenzione.
+  FORSE ROUTINE           → evento normale ma con qualche elemento da notare.
+  ROUTINE                 → evento completamente normale per orario, zona e soggetto.
+
+REGOLE DI RISPOSTA:
+ - HAI RICEVUTO ESATTAMENTE {n} EVENTI. DEVI CLASSIFICARNE ESATTAMENTE {n}. Né di più, né di meno.
+ - OGNI EVENTO COMPARE UNA SOLA VOLTA nella risposta. Duplicare un evento è un errore CRITICO.
+ - Assegna ogni evento alla sezione più appropriata in base a orario, zona e soggetto.
+ - NON RISCRIVERE la lista di eventi in blocco.
+ - Formato OBBLIGATORIO di ogni riga classificata:
+   [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiegazione>
+ - Non aggiungere il tipo di soggetto nelle righe di output.
+ - Se una sezione non ha eventi, OMETTILA completamente.
 
 Periodo analizzato: {start.strftime('%d/%m/%Y %H:%M')} → {end.strftime('%d/%m/%Y %H:%M')}
 
-EVENTI DA CLASSIFICARE ({len(events)}):
+HAI QUESTI EVENTI DA CLASSIFICARE :
 {eventi_txt}
 
-Rispondi in italiano con questa ESATTA struttura. Se una sezione non ha eventi IGNORALA.
-
-Riepilogo: <sintesi in 1-2 righe del periodo osservato>
+Rispondi in italiano con questa ESATTA struttura.
 
 ### ANOMALIA ESPLICITA
-- [HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega perché è una violazione>
+- [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega perché è una violazione>
 
 ### ANOMALIA CONTESTUALE
-- [HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega il contrasto orario/comportamento>
+- [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega perchè l'evento è giustificabile in base al contesto>
 
 ### POTENZIALMENTE ANOMALO
-- [HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega l'ambiguità>
+- [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega l'ambiguità>
 
 ### FORSE ROUTINE
-- [HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega perché è plausibile>
+- [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega perché è plausibile>
 
 ### ROUTINE
-- [HH:MM] <camera> (<location>) | <descrizione> | Motivo: <conferma normalità>"""
+- [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <conferma normalità>
+
+Riepilogo:
+"""
 
 @app.get("/", tags=["Sistema"])
 def home():
