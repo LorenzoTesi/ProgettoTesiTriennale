@@ -22,6 +22,19 @@ import sys
 from datetime import datetime, timedelta
 import httpx
 
+
+# VALIDATORI ARGPARSE
+def positive_float(value: str) -> int:
+    try:
+        fvalue = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{value}' non è un numero valido")
+    if fvalue <= 0:
+        raise argparse.ArgumentTypeError(
+            f"--freq deve essere un intero maggiore di 0 (valore ricevuto: {fvalue})"
+        )
+    return fvalue
+
 # Dati con cui si compilano i campi degli eventi
 CAMERAS = {
     "corridor_1": "corridoio principale",
@@ -201,7 +214,7 @@ def main():
     )
     parser.add_argument("--start", default=default_start, help="Inizio simulazione (ISO 8601)")
     parser.add_argument("--end", default=default_end, help="Fine simulazione (ISO 8601)")
-    parser.add_argument("--freq", type=float, default=3.0, help="Eventi medi per ora")
+    parser.add_argument("--freq", type=positive_float, default=3.0, help="Eventi medi per ora (deve essere > 0)")
     parser.add_argument("--stream", action="store_true", help="Invia eventi al backend")
     parser.add_argument("--interval", type=float, default=0.2, help="Secondi tra invii (stream)")
     parser.add_argument("--url", default="http://127.0.0.1:8000", help="URL backend FastAPI")

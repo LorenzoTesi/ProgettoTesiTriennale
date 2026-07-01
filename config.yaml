@@ -1,0 +1,116 @@
+# config.yaml — configurazione di dominio del sistema di sorveglianza
+
+# Tipi di evento ammessi
+event_types:
+  - movement
+  - crowd
+  - idle
+
+# Tag che identifica un soggetto come "dipendente" all'interno di metadata.tags
+actor_tags:
+  employee: employee
+
+# Registro telecamere, camera_id : location
+cameras:
+  corridor_1: corridoio principale
+  corridor_2: corridoio secondario
+  entrance_clients: ingresso principale per i clienti
+  reception_hall: sportello
+  vault: camera blindata
+  exit: uscita principale
+
+# Fasce orarie della struttura, usate nel contesto passato all'LLM
+time_windows:
+  - label: "Pre-apertura"
+    start: "06:00"
+    end: "08:00"
+    note: >-
+      La struttura è chiusa al pubblico e solo i dipendenti devono essere presenti.
+  - label: "Orario operativo"
+    start: "08:00"
+    end: "19:00"
+    note: >-
+      Persone che camminano, discutono o sostano nella struttura sono
+      comportamenti completamente ordinari.
+  - label: "Fuori orario"
+    start: "19:00"
+    end: "22:00"
+    note: >-
+      I dipendenti possono ancora trovarsi nella struttura, ma la presenza di
+      soggetti non autorizzati è una GRAVE VIOLAZIONE DI SICUREZZA.
+  - label: "Orario notturno"
+    start: "22:00"
+    end: "06:00"
+    note: >-
+      Qualsiasi presenza umana è quantomeno insolita e va segnalata.
+
+# Regole speciali legate a telecamere specifiche
+security_rules:
+  restricted_cameras:
+    - camera_id: vault
+      rule: >-
+        Per regolamento la camera blindata (vault) è accessibile solo ai
+        dipendenti in qualsiasi orario. La presenza di altri soggetti nella
+        camera blindata è una GRAVISSIMA VIOLAZIONE DI SICUREZZA durante
+        qualsiasi orario e va sempre riportata come tale.
+
+# Limiti applicativi
+limits:
+  max_events: 1000       # limite massimo assoluto richiedibile su /events
+  default_events: 100    # limite di default se non specificato
+
+# Indici MongoDB creati all'avvio del backend
+mongo_indexes:
+  - timestamp
+  - camera_id
+  - event_type
+
+# Configurazione LLM
+llm:
+  language: it
+  response_language_name: italiano
+  domain_description: "una struttura bancaria"
+
+  # Parametri di generazione di default
+  temperature: 0.1
+  min_num_ctx: 2048
+  min_output_tokens: 2048
+  tokens_per_event: 80
+
+  prompts:
+    custom_intro: >-
+      Sei un sistema di intelligenza artificiale per la sicurezza. Il tuo compito è
+      leggere attentamente la lista degli eventi riportata sotto, comprenderne il
+      significato e rispondere alla richiesta dell'operatore in modo diretto,
+      preciso e conciso.
+    summary_intro: >-
+      Sei un sistema di analisi della sicurezza per {domain_description}. Il tuo
+      compito è classificare ogni evento osservato tenendo conto dell'orario, del
+      luogo e del tipo di soggetto.
+
+  # Categorie di classificazione
+  categories:
+    - name: "ANOMALIA ESPLICITA"
+      guida: "GRAVE VIOLAZIONE DELLE REGOLE."
+      esempio_motivo: "spiega perché è una violazione"
+    - name: "ANOMALIA CONTESTUALE"
+      guida: "evento apparentemente grave ma giustificabile in base a orario, zona o soggetto."
+      esempio_motivo: "spiega perché l'evento è giustificabile in base al contesto"
+    - name: "POTENZIALMENTE ANOMALO"
+      guida: "ambiguo: potrebbe essere normale o sospetto, richiede attenzione."
+      esempio_motivo: "spiega l'ambiguità"
+    - name: "FORSE ROUTINE"
+      guida: "evento normale ma con qualche elemento da notare."
+      esempio_motivo: "spiega perché è plausibile"
+    - name: "ROUTINE"
+      guida: "evento completamente normale per orario, zona e soggetto."
+      esempio_motivo: "conferma normalità"
+
+# Schema del dataset eventi
+event_schema:
+  timestamp_field: timestamp
+  camera_field: camera_id
+  location_field: location
+  description_field: description
+  type_field: event_type
+  tags_field: metadata.tags

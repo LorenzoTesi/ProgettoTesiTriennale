@@ -8,28 +8,99 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 import httpx
 import os
+import yaml
+from dotenv import load_dotenv
 
+load_dotenv()
 
-# CONFIGURAZIONE
-MONGO_DETAILS = os.getenv(
-    "MONGO_DETAILS",
-    "mongodb+srv://lorenzotesi:Zekrom03!@progettotesi.eyjcybv.mongodb.net/?appName=ProgettoTesi",
-)
+MONGO_DETAILS = os.getenv("MONGO_DETAILS", "mongodb://mongodb:27017")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "sistema_eventi")
+MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "eventi_osservati")
 
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = "llama3.2"
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+
+CONFIG_PATH = os.getenv("CONFIG_PATH", "config.yaml")
+
+
+#dominio applicatifo da config.yaml
+def load_domain_config(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"File di configurazione '{path}' non trovato. "
+            "Verifica CONFIG_PATH nel .env e che config.yaml sia presente "
+            "(e copiato nell'immagine Docker)."
+        )
+    return cfg
+
+
+DOMAIN_CONFIG = load_domain_config(CONFIG_PATH)
+
+ALLOWED_EVENT_TYPES = set(DOMAIN_CONFIG.get("event_types", ["movement", "crowd", "idle"]))
+CAMERAS_REGISTRY = DOMAIN_CONFIG.get("cameras", {})
+EMPLOYEE_TAG = DOMAIN_CONFIG.get("actor_tags", {}).get("employee", "employee")
+TIME_WINDOWS = DOMAIN_CONFIG.get("time_windows", [])
+SECURITY_RULES = DOMAIN_CONFIG.get("security_rules", {})
+LIMITS_CONFIG = DOMAIN_CONFIG.get("limits", {})
+MAX_EVENTS_LIMIT = LIMITS_CONFIG.get("max_events", 1000)
+DEFAULT_EVENTS_LIMIT = LIMITS_CONFIG.get("default_events", 100)
+MONGO_INDEXES = DOMAIN_CONFIG.get("mongo_indexes", ["timestamp", "camera_id", "event_type"])
+LLM_CONFIG = DOMAIN_CONFIG.get("llm", {})
+LLM_CATEGORIES = LLM_CONFIG.get("categories", [])
+LLM_LANGUAGE = LLM_CONFIG.get("language", "it")
+LLM_TEMPERATURE = LLM_CONFIG.get("temperature", 0.1)
+LLM_MIN_NUM_CTX = LLM_CONFIG.get("min_num_ctx", 2048)
+LLM_MIN_OUTPUT_TOKENS = LLM_CONFIG.get("min_output_tokens", 2048)
+LLM_TOKENS_PER_EVENT = LLM_CONFIG.get("tokens_per_event", 80)
+LLM_RESPONSE_LANGUAGE = LLM_CONFIG.get("response_language_name", "italiano")
+LLM_DOMAIN_DESCRIPTION = LLM_CONFIG.get("domain_description", "una struttura")
+LLM_PROMPTS = LLM_CONFIG.get("prompts", {})
+
+# Schema del dataset eventi (nomi dei campi), definito in config.yaml
+EVENT_SCHEMA = DOMAIN_CONFIG.get("event_schema", {})
+FIELD_TIMESTAMP   = EVENT_SCHEMA.get("timestamp_field", "timestamp")
+FIELD_CAMERA      = EVENT_SCHEMA.get("camera_field", "camera_id")
+FIELD_LOCATION    = EVENT_SCHEMA.get("location_field", "location")
+FIELD_DESCRIPTION = EVENT_SCHEMA.get("description_field", "description")
+FIELD_TYPE        = EVENT_SCHEMA.get("type_field", "event_type")
+FIELD_TAGS        = EVENT_SCHEMA.get("tags_field", "metadata.tags")
+
+
+def get_nested_field(doc: dict, dotted_field: str, default=None):
+    """Legge un campo anche annidato, es. 'metadata.tags'."""
+    value = doc
+    for part in dotted_field.split("."):
+        if isinstance(value, dict):
+            value = value.get(part)
+        else:
+            return default
+    return value if value is not None else default
+
+
+PROMPT_CUSTOM_INTRO = LLM_PROMPTS.get(
+    "custom_intro",
+    "Sei un sistema di intelligenza artificiale per la sicurezza."
+)
+PROMPT_SUMMARY_INTRO = LLM_PROMPTS.get(
+    "summary_intro",
+    "Sei un sistema di analisi della sicurezza per {domain_description}."
+).format(domain_description=LLM_DOMAIN_DESCRIPTION)
 
 mongo_client = AsyncIOMotorClient(MONGO_DETAILS)
-database     = mongo_client.sistema_eventi
-collection   = database.get_collection("eventi_osservati")
-
+database     = mongo_client[MONGO_DB_NAME]
+collection   = database.get_collection(MONGO_COLLECTION_NAME)
 
 # LIFECYCLE
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await collection.create_index("timestamp")
-    await collection.create_index("camera_id")
-    await collection.create_index("event_type")
+    for field in MONGO_INDEXES:
+        await collection.create_index(field)
     yield
 
 app = FastAPI(
@@ -46,36 +117,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ALLOWED_EVENT_TYPES = {"movement", "crowd", "idle"}
+def _build_contesto_struttura() -> str:
+    mappa_telecamere_txt = "\n".join(f"  - {k}: {v}" for k, v in CAMERAS_REGISTRY.items())
 
-CAMERAS_REGISTRY = {
-    "corridor_1": "corridoio principale",
-    "corridor_2": "corridoio secondario",
-    "entrance_clients": "ingresso principale per i clienti",
-    "reception_hall": "sportello",
-    "vault": "camera blindata",
-    "exit": "uscita principale",
-}
+    fasce_orarie_txt = "\n".join(
+        f"  {tw['start']}–{tw['end']}  {tw['label']}"
+        for tw in TIME_WINDOWS
+    )
 
-_MAPPA_TELECAMERE_TXT = "\n".join(f"  - {k}: {v}" for k, v in CAMERAS_REGISTRY.items())
+    criteri_txt_righe = [
+        f"  - {tw['label']} ({tw['start']}-{tw['end']}): {tw['note']}"
+        for tw in TIME_WINDOWS
+    ]
+    for regola in SECURITY_RULES.get("restricted_cameras", []):
+        criteri_txt_righe.append(f"  - {regola['rule']}")
+    criteri_txt = "\n".join(criteri_txt_righe)
 
-CONTESTO_STRUTTURA = f"""CONTESTO DELLA STRUTTURA:
+    return f"""CONTESTO DELLA STRUTTURA:
 
 TELECAMERE E MAPPA DELLE ZONE:
-{_MAPPA_TELECAMERE_TXT}
+{mappa_telecamere_txt}
 
 FASCE ORARIE DELLA STRUTTURA:
-  06:00–08:00  Pre-apertura       
-  08:00–19:00  Orario operativo   
-  19:00–22:00  Fuori orario
-  22:00–06:00  Orario notturno
+{fasce_orarie_txt}
 
 CRITERI DI SICUREZZA E NORMALITÀ:
-  - In orario di pre-apertura (06:00-08:00) la struttura è chiusa al pubblico e solo i dipendenti devono essere presenti.
-  - In orario operativo (08:00-19:00) persone che camminano, discutono o sostano nella struttura sono comportamenti completamente ordinari.
-  - Fuori orario (19:00-22:00) i dipendenti possono ancora trovarsi nella struttura, ma la presenza di soggetti non autorizzati è una GRAVE VIOLAZIONE DI SICUREZZA.
-  - Di notte (22:00-06:00) qualsiasi presenza umana è quantomeno insolita e va segnalata.
-  - Per regolamento la camera blindata (vault) è accessibile solo ai dipendenti in qualsiasi orario. La presenza di altri soggetti nella camera blindata è una GRAVISSIMA VIOLAZIONE DI SICUREZZA durante qualsiasi orario e va sempre riportata come tale."""
+{criteri_txt}"""
+
+
+CONTESTO_STRUTTURA = _build_contesto_struttura()
 
 # SCHEMI PYDANTIC
 class EventMetadata(BaseModel):
@@ -96,14 +166,6 @@ class Event(BaseModel):
         if v not in ALLOWED_EVENT_TYPES:
             raise ValueError(f"event_type deve essere uno di: {ALLOWED_EVENT_TYPES}")
         return v
-
-    @field_validator("timestamp")
-    @classmethod
-    def validate_timestamp(cls, v: datetime) -> datetime:
-        if v > datetime.now():
-            raise ValueError("Il timestamp non può essere nel futuro")
-        return v
-
 
 class SummaryRequest(BaseModel):
     start: datetime = Field(
@@ -173,7 +235,7 @@ def _build_time_query(start: datetime, end: datetime) -> dict:
             )
 
         clauses.append({
-            "timestamp": {
+            FIELD_TIMESTAMP: {
                 "$gte": window_start.isoformat(),
                 "$lte": window_end.isoformat()
             }
@@ -186,8 +248,8 @@ def _build_time_query(start: datetime, end: datetime) -> dict:
 # MODULO LLM — OLLAMA LOCALE
 async def call_llm(prompt: str, n_events: int = 0) -> str:
 
-    output_tokens = max(2048, n_events * 80 + 1024)
-    prompt_tokens_estimate = max(2048, len(prompt) // 4)
+    output_tokens = max(LLM_MIN_OUTPUT_TOKENS, n_events * LLM_TOKENS_PER_EVENT + 1024)
+    prompt_tokens_estimate = max(LLM_MIN_NUM_CTX, len(prompt) // 4)
     num_ctx = int((prompt_tokens_estimate + output_tokens) * 1.2)
     ctx_power2 = 1
     while ctx_power2 < num_ctx:
@@ -200,7 +262,7 @@ async def call_llm(prompt: str, n_events: int = 0) -> str:
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.1,
+            "temperature": LLM_TEMPERATURE,
             "num_predict": output_tokens,
             "num_ctx": num_ctx,
         },
@@ -246,28 +308,35 @@ def _build_summary_prompt(
 ) -> str:
     righe = []
     for e in events:
-        tags = e.get("metadata", {}).get("tags", [])
-        soggetto = "dipendente autorizzato" if "employee" in tags else "persona esterna non autorizzata"
-        ts = e["timestamp"]
+        tags = get_nested_field(e, FIELD_TAGS, [])
+        soggetto = "dipendente autorizzato" if EMPLOYEE_TAG in tags else "persona esterna non autorizzata"
+        ts = e.get(FIELD_TIMESTAMP)
         if isinstance(ts, str):
             ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         data_ora = ts.strftime("%d/%m/%Y %H:%M")
+        camera_id   = e.get(FIELD_CAMERA)
+        location    = e.get(FIELD_LOCATION)
+        description = e.get(FIELD_DESCRIPTION)
         righe.append(
-            f"[{data_ora}] {e['camera_id']} ({e['location']}) | {e['description']} | soggetto:{soggetto}"
+            f"[{data_ora}] {camera_id} ({location}) | {description} | soggetto:{soggetto}"
         )
     eventi_txt = "\n".join(righe)
     n = len(events)
 
-    return f"""Sei un sistema di analisi della sicurezza per una struttura bancaria. Il tuo compito è classificare ogni evento osservato tenendo conto dell'orario, del luogo e del tipo di soggetto.
+    guida_categorie_txt = "\n".join(
+        f"  {c['name']:<24}→ {c['guida']}" for c in LLM_CATEGORIES
+    )
+    struttura_sezioni_txt = "\n\n".join(
+        f"### {c['name']}\n"
+        f"- [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <{c['esempio_motivo']}>"
+        for c in LLM_CATEGORIES
+    )
 
+    return f"""{PROMPT_SUMMARY_INTRO}
 {CONTESTO_STRUTTURA}
 
 GUIDA ALLE CATEGORIE (usala per assegnare ogni evento):
-  ANOMALIA ESPLICITA      → GRAVE VIOLAZIONE DELLE REGOLE.
-  ANOMALIA CONTESTUALE    → evento apparentemente grave ma giustificabile in base a orario, zona o soggetto.
-  POTENZIALMENTE ANOMALO  → ambiguo: potrebbe essere normale o sospetto, richiede attenzione.
-  FORSE ROUTINE           → evento normale ma con qualche elemento da notare.
-  ROUTINE                 → evento completamente normale per orario, zona e soggetto.
+{guida_categorie_txt}
 
 REGOLE DI RISPOSTA:
  - HAI RICEVUTO ESATTAMENTE {n} EVENTI. DEVI CLASSIFICARNE ESATTAMENTE {n}. Né di più, né di meno.
@@ -275,7 +344,7 @@ REGOLE DI RISPOSTA:
  - Assegna ogni evento alla sezione più appropriata in base a orario, zona e soggetto.
  - NON RISCRIVERE la lista di eventi in blocco.
  - Formato OBBLIGATORIO di ogni riga classificata:
-   [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiegazione>
+   [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <la tua spiegazione>
  - Non aggiungere il tipo di soggetto nelle righe di output.
  - Se una sezione non ha eventi, OMETTILA completamente.
 
@@ -284,22 +353,8 @@ Periodo analizzato: {start.strftime('%d/%m/%Y %H:%M')} → {end.strftime('%d/%m/
 HAI QUESTI EVENTI DA CLASSIFICARE :
 {eventi_txt}
 
-Rispondi in italiano con questa ESATTA struttura.
-
-### ANOMALIA ESPLICITA
-- [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega perché è una violazione>
-
-### ANOMALIA CONTESTUALE
-- [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega perchè l'evento è giustificabile in base al contesto>
-
-### POTENZIALMENTE ANOMALO
-- [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega l'ambiguità>
-
-### FORSE ROUTINE
-- [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <spiega perché è plausibile>
-
-### ROUTINE
-- [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <conferma normalità>
+Rispondi in {LLM_RESPONSE_LANGUAGE} con questa ESATTA struttura.
+{struttura_sezioni_txt}
 
 Riepilogo:
 """
@@ -311,6 +366,10 @@ def home():
         "version": "2.0.0",
         "ollama_url": OLLAMA_BASE_URL,
         "ollama_model": OLLAMA_MODEL,
+        "llm_provider": LLM_PROVIDER,
+        "mongo_db": MONGO_DB_NAME,
+        "mongo_collection": MONGO_COLLECTION_NAME,
+        "config_path": CONFIG_PATH,
         "docs": "/docs",
     }
 
@@ -346,7 +405,7 @@ async def get_events(
     camera_ids: Optional[list[str]] = Query(None, description="Filtra per una o più camere"),
     event_type: Optional[str] = Query(None, description="Filtra per tipo di evento"),
     location: Optional[str] = Query(None, description="Parola chiave nella location"),
-    limit: int = Query(100, ge=0, le=1000),
+    limit: int = Query(DEFAULT_EVENTS_LIMIT, ge=0, le=MAX_EVENTS_LIMIT),
 ):
     if end <= start:
         raise HTTPException(status_code=400, detail="'end' deve essere successivo a 'start'")
@@ -355,25 +414,25 @@ async def get_events(
 
     if camera_ids:
         conditions.append({
-        "camera_id": {"$in": camera_ids}
+        FIELD_CAMERA: {"$in": camera_ids}
         })
     if event_type:
         if event_type not in ALLOWED_EVENT_TYPES:
             raise HTTPException(status_code=400, detail=f"event_type non valido: {ALLOWED_EVENT_TYPES}")
 
         conditions.append({
-            "event_type": event_type
+            FIELD_TYPE: event_type
         })
 
     if location:
         conditions.append({
-            "location": {
+            FIELD_LOCATION: {
                 "$regex": location,
                 "$options": "i"
             }
         })
     query = {"$and": conditions}
-    cursor = collection.find(query).sort("timestamp", 1)
+    cursor = collection.find(query).sort(FIELD_TIMESTAMP, 1)
 
     if limit > 0:
         cursor = cursor.limit(limit)
@@ -430,7 +489,7 @@ async def delete_events_in_range(
 
     query = _build_time_query(start, end)
     if camera_ids:
-        query["camera_id"] = {"$in": camera_ids}
+        query[FIELD_CAMERA] = {"$in": camera_ids}
 
     result = await collection.delete_many(query)
     return {"status": "deleted", "deleted_count": result.deleted_count}
@@ -449,7 +508,7 @@ async def get_stats(
     query = _build_time_query(start, end)
 
     if camera_ids:
-        query["camera_id"] = {"$in": camera_ids}
+        query[FIELD_CAMERA] = {"$in": camera_ids}
 
     cursor = collection.find(query)
     events = [doc_to_event(doc) async for doc in cursor]
@@ -457,8 +516,10 @@ async def get_stats(
     by_type: dict[str, int] = {}
     by_camera: dict[str, int] = {}
     for e in events:
-        by_type[e["event_type"]] = by_type.get(e["event_type"], 0) + 1
-        by_camera[e["camera_id"]] = by_camera.get(e["camera_id"], 0) + 1
+        tipo = get_nested_field(e, FIELD_TYPE)
+        cam = get_nested_field(e, FIELD_CAMERA)
+        by_type[tipo] = by_type.get(tipo, 0) + 1
+        by_camera[cam] = by_camera.get(cam, 0) + 1
 
     return {
         "period": {"start": start.isoformat(), "end": end.isoformat()},
@@ -479,7 +540,7 @@ async def generate_summary(req: SummaryRequest):
     query = _build_time_query(req.start, end)
 
     if req.camera_ids:
-        query["camera_id"] = {"$in": req.camera_ids}
+        query[FIELD_CAMERA] = {"$in": req.camera_ids}
 
     if req.selected_events:
         events = req.selected_events
@@ -499,23 +560,26 @@ async def generate_summary(req: SummaryRequest):
     if req.custom_prompt and req.custom_prompt.strip():
         righe_lista = []
         for e in events:
-            tags = e.get("metadata", {}).get("tags", [])
-            soggetto = "dipendente autorizzato" if "employee" in tags else "persona non autorizzata"
-            ts = e["timestamp"]
+            tags = get_nested_field(e, FIELD_TAGS, [])
+            soggetto = "dipendente autorizzato" if EMPLOYEE_TAG in tags else "persona non autorizzata"
+            ts = e.get(FIELD_TIMESTAMP)
             if isinstance(ts, str):
                 ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
             ora = ts.strftime("%H:%M")
+            camera_id   = e.get(FIELD_CAMERA)
+            location    = e.get(FIELD_LOCATION)
+            event_type_ = e.get(FIELD_TYPE)
+            description = e.get(FIELD_DESCRIPTION)
             righe_lista.append(
-                f"- [{ora}] Camera: {e['camera_id']} ({e['location']}) | Tipo: {e['event_type']} | Soggetto: {soggetto} | Descrizione: {e['description']}"
+                f"- [{ora}] Camera: {camera_id} ({location}) | Tipo: {event_type_} | Soggetto: {soggetto} | Descrizione: {description}"
             )
         righe_eventi = "\n".join(righe_lista)
         prompt = (
-            f"Sei un sistema di intelligenza artificiale per la sicurezza. Il tuo compito è leggere attentamente la lista degli eventi riportata sotto, "
-            f"comprenderne il significato e rispondere alla richiesta dell'operatore in modo diretto, preciso e conciso.\n\n"
+            f"{PROMPT_CUSTOM_INTRO}\n\n"
             f"{CONTESTO_STRUTTURA}\n\n"
             f"ISTRUZIONI ADDIZIONALI:\n"
             f"- Se la richiesta implica un conteggio (es. 'quanti...'), analizza i testi, conta gli elementi corrispondenti e fornisci il risultato numerico.\n"
-            f"- Rispondi in italiano e non ripetere l'intera lista degli eventi nella risposta.\n\n"
+            f"- Rispondi in {LLM_RESPONSE_LANGUAGE} e non ripetere l'intera lista degli eventi nella risposta.\n\n"
             f"RICHIESTA OPERATORE: {req.custom_prompt}\n\n"
             f"LISTA DEGLI EVENTI DA ANALIZZARE ({len(events)} totali):\n{righe_eventi}\n\n"
         )
