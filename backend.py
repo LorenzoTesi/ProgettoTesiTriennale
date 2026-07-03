@@ -10,6 +10,7 @@ import httpx
 import os
 import yaml
 from dotenv import load_dotenv
+from openai import AsyncOpenAI, APIConnectionError, APIStatusError, APITimeoutError
 
 load_dotenv()
 
@@ -17,7 +18,7 @@ MONGO_DETAILS = os.getenv("MONGO_DETAILS", "mongodb://mongodb:27017")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "sistema_eventi")
 MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "eventi_osservati")
 
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -25,8 +26,20 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 CONFIG_PATH = os.getenv("CONFIG_PATH", "config.yaml")
 
+VALID_LLM_PROVIDERS = {"ollama", "openai"}
+if LLM_PROVIDER not in VALID_LLM_PROVIDERS:
+    raise RuntimeError(
+        f"LLM_PROVIDER='{LLM_PROVIDER}' non valido. Valori ammessi: {sorted(VALID_LLM_PROVIDERS)}. "
+        "Controlla la variabile LLM_PROVIDER nel file .env."
+    )
+if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
+    raise RuntimeError(
+        "LLM_PROVIDER='openai' ma OPENAI_API_KEY non è impostata nel file .env."
+    )
 
-#dominio applicatifo da config.yaml
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+#dominio applicativo da config.yaml
 def load_domain_config(path: str) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -73,7 +86,6 @@ FIELD_TAGS        = EVENT_SCHEMA.get("tags_field", "metadata.tags")
 
 
 def get_nested_field(doc: dict, dotted_field: str, default=None):
-    """Legge un campo anche annidato, es. 'metadata.tags'."""
     value = doc
     for part in dotted_field.split("."):
         if isinstance(value, dict):
@@ -104,9 +116,9 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(
-    title="Sistema Sorveglianza Intelligente (Ollama)",
-    version="1.0.0",
-    description="Backend con LLM locale Ollama per sintesi eventi di sorveglianza.",
+    title="Sistema Sorveglianza Intelligente",
+    version="2.0.0",
+    description="Backend con LLM configurabile (Ollama locale o OpenAI cloud) per sintesi eventi di sorveglianza.",
     lifespan=lifespan
 )
 
@@ -245,9 +257,9 @@ def _build_time_query(start: datetime, end: datetime) -> dict:
 
     return {"$or": clauses}
 
-# MODULO LLM — OLLAMA LOCALE
-async def call_llm(prompt: str, n_events: int = 0) -> str:
-
+#dispatch tra Ollama locale e OpenAI cloud, in base a LLM_PROVIDER
+def _compute_generation_params(prompt: str, n_events: int) -> tuple[int, int]:
+    #calcolo dinamico dei token solo per Ollama
     output_tokens = max(LLM_MIN_OUTPUT_TOKENS, n_events * LLM_TOKENS_PER_EVENT + 1024)
     prompt_tokens_estimate = max(LLM_MIN_NUM_CTX, len(prompt) // 4)
     num_ctx = int((prompt_tokens_estimate + output_tokens) * 1.2)
@@ -255,6 +267,11 @@ async def call_llm(prompt: str, n_events: int = 0) -> str:
     while ctx_power2 < num_ctx:
         ctx_power2 *= 2
     num_ctx = min(ctx_power2, 65536)
+    return output_tokens, num_ctx
+
+
+async def _call_ollama(prompt: str, n_events: int) -> str:
+    output_tokens, num_ctx = _compute_generation_params(prompt, n_events)
 
     url = f"{OLLAMA_BASE_URL}/api/generate"
     payload = {
@@ -282,6 +299,37 @@ async def call_llm(prompt: str, n_events: int = 0) -> str:
         return f"[Errore Ollama] {type(e).__name__}: {e}"
 
 
+async def _call_openai(prompt: str, n_events: int) -> str:
+    if openai_client is None:
+        return "[Errore OpenAI] OPENAI_API_KEY non configurata."
+
+    output_tokens, _ = _compute_generation_params(prompt, n_events)
+
+    try:
+        response = await openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=LLM_TEMPERATURE,
+            max_tokens=output_tokens,
+        )
+        content = response.choices[0].message.content
+        return content if content else "[OpenAI: risposta vuota]"
+    except APIConnectionError:
+        return "[Errore OpenAI] Impossibile connettersi all'API OpenAI."
+    except APITimeoutError:
+        return f"[Errore OpenAI] Timeout '{OPENAI_MODEL}'."
+    except APIStatusError as e:
+        return f"[Errore OpenAI] {e.status_code}: {e.message}"
+    except Exception as e:
+        return f"[Errore OpenAI] {type(e).__name__}: {e}"
+
+
+async def call_llm(prompt: str, n_events: int = 0) -> str:
+    if LLM_PROVIDER == "openai":
+        return await _call_openai(prompt, n_events)
+    return await _call_ollama(prompt, n_events)
+
+
 async def check_ollama_status() -> dict:
     try:
         async with httpx.AsyncClient(timeout=5) as client:
@@ -290,6 +338,7 @@ async def check_ollama_status() -> dict:
             models = [m["name"] for m in r.json().get("models", [])]
             model_available = any(OLLAMA_MODEL in m for m in models)
             return {
+                "provider": "ollama",
                 "ollama_reachable": True,
                 "models_available": models,
                 "requested_model": OLLAMA_MODEL,
@@ -297,7 +346,40 @@ async def check_ollama_status() -> dict:
                 "warning": None if model_available else f"Modello '{OLLAMA_MODEL}' non trovato.",
             }
     except Exception as e:
-        return {"ollama_reachable": False, "error": str(e)}
+        return {"provider": "ollama", "ollama_reachable": False, "error": str(e)}
+
+
+async def check_openai_status() -> dict:
+    if openai_client is None:
+        return {
+            "provider": "openai",
+            "openai_reachable": False,
+            "error": "OPENAI_API_KEY non configurata.",
+        }
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(
+                "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            )
+            r.raise_for_status()
+            models = [m["id"] for m in r.json().get("data", [])]
+            model_available = any(OPENAI_MODEL in m for m in models) if models else True
+            return {
+                "provider": "openai",
+                "openai_reachable": True,
+                "requested_model": OPENAI_MODEL,
+                "model_ready": model_available,
+                "warning": None if model_available else f"Modello '{OPENAI_MODEL}' non trovato tra quelli disponibili.",
+            }
+    except Exception as e:
+        return {"provider": "openai", "openai_reachable": False, "error": str(e)}
+
+
+async def check_llm_status() -> dict:
+    if LLM_PROVIDER == "openai":
+        return await check_openai_status()
+    return await check_ollama_status()
 
 
 def _build_summary_prompt(
@@ -362,11 +444,12 @@ Riepilogo:
 @app.get("/", tags=["Sistema"])
 def home():
     return {
-        "message": "Sistema di archiviazione eventi attivo (LLM: Ollama locale)",
+        "message": f"Sistema di archiviazione eventi attivo (LLM: {LLM_PROVIDER})",
         "version": "2.0.0",
+        "llm_provider": LLM_PROVIDER,
         "ollama_url": OLLAMA_BASE_URL,
         "ollama_model": OLLAMA_MODEL,
-        "llm_provider": LLM_PROVIDER,
+        "openai_model": OPENAI_MODEL if LLM_PROVIDER == "openai" else None,
         "mongo_db": MONGO_DB_NAME,
         "mongo_collection": MONGO_COLLECTION_NAME,
         "config_path": CONFIG_PATH,
@@ -375,7 +458,7 @@ def home():
 
 @app.get("/llm/status", tags=["Sistema"])
 async def llm_status():
-    return await check_ollama_status()
+    return await check_llm_status()
 
 
 # ENDPOINT — CAMERAS
@@ -591,11 +674,17 @@ async def generate_summary(req: SummaryRequest):
     if req.custom_prompt and req.custom_prompt.strip():
         return {"summary": sintesi}
 
+    llm_backend_label = (
+        f"OpenAI ({OPENAI_MODEL})"
+        if LLM_PROVIDER == "openai"
+        else f"Ollama ({OLLAMA_MODEL}) @ {OLLAMA_BASE_URL}"
+    )
+
     return {
         "period": {"start": req.start.isoformat(), "end": end.isoformat()},
         "end_auto": req.end is None,
         "camera_ids": req.camera_ids,
-        "llm_backend": f"Ollama ({OLLAMA_MODEL}) @ {OLLAMA_BASE_URL}",
+        "llm_backend": llm_backend_label,
         "total_events": len(events),
         "summary": sintesi,
     }
