@@ -171,7 +171,7 @@ if load_button:
                 stats_params["camera_ids"] = camere_attive
             st.session_state.loaded_stats = get_stats(stats_params)
 
-tab_dashboard, tab_intelligenza_art = st.tabs(["Monitoraggio Eventi", "Analisi e Sintesi AI"])
+tab_dashboard, tab_intelligenza_art, tab_responses = st.tabs(["Monitoraggio Eventi ", " Analisi e Sintesi AI"," Visualizza risposte"])
 
 # Tab 1: Visualizzazione dati
 with tab_dashboard:
@@ -301,6 +301,122 @@ with tab_intelligenza_art:
                     st.success("Elaborazione completata!")
                     st.subheader("Analisi di Ollama")
                     st.markdown(summary_data["summary"])
+
+#Tab 3 log delle risposte passate
+    with tab_responses:
+
+        st.subheader("Log delle risposte")
+
+        if "history_view" not in st.session_state:
+            st.session_state.history_view = None
+
+        left, center, right = st.columns([1, 2, 1])
+
+        with center:
+
+            c1, c2 = st.columns(2)
+
+            with c1:
+                if st.button(
+                        "Sintesi passate",
+                        use_container_width=True,
+                ):
+                    st.session_state.history_view = "analysis"
+
+            with c2:
+                if st.button(
+                        "Risposte ai prompt",
+                        use_container_width=True,
+                ):
+                    st.session_state.history_view = "prompt"
+
+        st.divider()
+
+        if st.session_state.history_view == "analysis":
+
+            response = requests.get(f"{API_BASE_URL}/analysis_history")
+
+            if response.status_code == 200:
+
+                storico = response.json()
+
+                if not storico:
+                    st.info("Non sono presenti analisi salvate.")
+                else:
+
+                    for item in storico:
+                        dt = datetime.fromisoformat(item["request_date"].replace("Z", "+00:00"))
+                        titolo = dt.strftime(" %d/%m/%Y  %H:%M")
+
+                        with st.expander(titolo):
+                            st.markdown(f"**Data richiesta:** {item['request_date']}")
+
+                            st.markdown(
+                                f"**Periodo analizzato:** "
+                                f"{item['data_inizio']} {item['ora_inizio']} → "
+                                f"{item['data_fine']} {item['ora_fine']}"
+                            )
+
+                            camere = ", ".join(item["camera_ids"]) if item["camera_ids"] else "Tutte"
+
+                            st.markdown(f"**Camere:** {camere}")
+
+                            st.markdown(f"**Numero eventi:** {item['numero_eventi']}")
+
+                            st.divider()
+
+                            st.markdown("### Sintesi AI")
+
+                            st.write(item["risposta"])
+
+            else:
+                st.error("Errore durante il recupero delle analisi.")
+
+        elif st.session_state.history_view == "prompt":
+
+            response = requests.get(f"{API_BASE_URL}/prompt_history")
+
+            if response.status_code == 200:
+
+                storico = response.json()
+
+                if not storico:
+                    st.info("Non sono presenti prompt salvati.")
+                else:
+
+                    for item in storico:
+                        dt = datetime.fromisoformat(item["request_date"].replace("Z", "+00:00"))
+                        titolo = dt.strftime(" %d/%m/%Y  %H:%M")
+
+                        with st.expander(titolo):
+                            st.markdown(f"**Data richiesta:** {item['request_date']}")
+
+                            st.markdown(
+                                f"**Periodo analizzato:** "
+                                f"{item['data_inizio']} {item['ora_inizio']} → "
+                                f"{item['data_fine']} {item['ora_fine']}"
+                            )
+
+                            camere = ", ".join(item["camera_ids"]) if item["camera_ids"] else "Tutte"
+
+                            st.markdown(f"**Camere:** {camere}")
+
+                            st.markdown(f"**Numero eventi:** {item['numero_eventi']}")
+
+                            st.markdown("### Prompt dell'utente")
+
+                            st.info(item["prompt"])
+
+                            st.divider()
+
+                            st.markdown("### Risposta AI")
+
+                            st.write(item["risposta"])
+
+            else:
+                st.error("Errore durante il recupero dei prompt.")
+
+    st.divider()
 
 # FOOTER
 st.divider()

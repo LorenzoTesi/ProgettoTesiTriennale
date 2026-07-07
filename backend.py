@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, timezone
 from typing import Optional
 from contextlib import asynccontextmanager
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -17,6 +17,9 @@ load_dotenv()
 MONGO_DETAILS = os.getenv("MONGO_DETAILS", "mongodb://mongodb:27017")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "sistema_eventi")
 MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "eventi_osservati")
+MONGO_ANALYSIS_COLLECTION = os.getenv("MONGO_ANALYSIS_COLLECTION","risposte_analisi")
+MONGO_PROMPT_COLLECTION = os.getenv("MONGO_PROMPT_COLLECTION","risposte_prompt")
+
 
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -107,6 +110,8 @@ PROMPT_SUMMARY_INTRO = LLM_PROMPTS.get(
 mongo_client = AsyncIOMotorClient(MONGO_DETAILS)
 database     = mongo_client[MONGO_DB_NAME]
 collection   = database.get_collection(MONGO_COLLECTION_NAME)
+analysis_collection = database.get_collection(MONGO_ANALYSIS_COLLECTION)
+prompt_collection = database.get_collection(MONGO_PROMPT_COLLECTION)
 
 # LIFECYCLE
 @asynccontextmanager
@@ -534,7 +539,6 @@ async def get_events(
         "events": events,
     }
 
-
 @app.get("/events/{event_id}", tags=["Eventi"])
 async def get_event_by_id(event_id: str):
     try:
@@ -672,6 +676,12 @@ async def generate_summary(req: SummaryRequest):
     sintesi = await call_llm(prompt, n_events=len(events))
 
     if req.custom_prompt and req.custom_prompt.strip():
+        await salva_risposta_prompt(
+            req,
+            end,
+            len(events),
+            sintesi,
+        )
         return {"summary": sintesi}
 
     llm_backend_label = (
@@ -679,7 +689,12 @@ async def generate_summary(req: SummaryRequest):
         if LLM_PROVIDER == "openai"
         else f"Ollama ({OLLAMA_MODEL}) @ {OLLAMA_BASE_URL}"
     )
-
+    await salva_risposta_analisi(
+        req,
+        end,
+        len(events),
+        sintesi,
+    )
     return {
         "period": {"start": req.start.isoformat(), "end": end.isoformat()},
         "end_auto": req.end is None,
@@ -688,3 +703,78 @@ async def generate_summary(req: SummaryRequest):
         "total_events": len(events),
         "summary": sintesi,
     }
+
+
+#metodi per salvare le risposte in mongodb
+async def salva_risposta_analisi(
+    req,
+    end,
+    total_events,
+    risposta
+):
+    documento = {
+        "request_date": datetime.now(timezone.utc),
+        "camera_ids": req.camera_ids,
+        "numero_eventi": total_events,
+        "data_inizio": req.start.date().isoformat(),
+        "data_fine": end.date().isoformat(),
+        "ora_inizio": req.start.time().isoformat(timespec="seconds"),
+        "ora_fine": end.time().isoformat(timespec="seconds"),
+        "risposta": risposta,
+    }
+
+    await analysis_collection.insert_one(documento)
+
+
+async def salva_risposta_prompt(
+    req,
+    end,
+    total_events,
+    risposta
+):
+    documento = {
+        "request_date": datetime.now(timezone.utc),
+        "camera_ids": req.camera_ids,
+        "numero_eventi": total_events,
+        "data_inizio": req.start.date().isoformat(),
+        "data_fine": end.date().isoformat(),
+        "ora_inizio": req.start.time().isoformat(timespec="seconds"),
+        "ora_fine": end.time().isoformat(timespec="seconds"),
+        "prompt": req.custom_prompt,
+        "risposta": risposta,
+    }
+
+    await prompt_collection.insert_one(documento)
+
+#recupero risposte passate
+@app.get("/analysis_history")
+async def analysis_history():
+
+    risultati = []
+
+    cursor = analysis_collection.find().sort(
+        "request_date",
+        -1
+    )
+
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        risultati.append(doc)
+
+    return risultati
+
+@app.get("/prompt_history")
+async def prompt_history():
+
+    risultati = []
+
+    cursor = prompt_collection.find().sort(
+        "request_date",
+        -1
+    )
+
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        risultati.append(doc)
+
+    return risultati
