@@ -349,6 +349,23 @@ with tab_intelligenza_art:
                         titolo = dt.strftime(" %d/%m/%Y  %H:%M")
 
                         with st.expander(titolo):
+                            _, col_delete = st.columns([10, 1])
+
+                            with col_delete:
+                                if st.button(
+                                        "Elimina",
+                                        key=f"delete_analysis_{item['_id']}",
+                                        use_container_width=True,
+                                ):
+                                    response = requests.delete(
+                                        f"{API_BASE_URL}/analysis_history/{item['_id']}"
+                                    )
+
+                                    if response.status_code == 200:
+                                        st.success("Analisi eliminata.")
+                                        st.rerun()
+                                    else:
+                                        st.error("Errore durante l'eliminazione.")
                             st.markdown(f"**Data richiesta:** {item['request_date']}")
 
                             st.markdown(
@@ -362,6 +379,12 @@ with tab_intelligenza_art:
                             st.markdown(f"**Camere:** {camere}")
 
                             st.markdown(f"**Numero eventi:** {item['numero_eventi']}")
+
+                            tipi_eventi = ", ".join(item.get("tipi_eventi", [])) if item.get("tipi_eventi") else "Tutti"
+
+                            st.markdown(f"**Tipi evento:** {tipi_eventi}")
+
+                            st.markdown(f"**LLM:** {item.get('LLM', 'N/D')}")
 
                             st.divider()
 
@@ -389,6 +412,23 @@ with tab_intelligenza_art:
                         titolo = dt.strftime(" %d/%m/%Y  %H:%M")
 
                         with st.expander(titolo):
+                            _, col_delete = st.columns([10, 1])
+
+                            with col_delete:
+                                if st.button(
+                                        "Elimina",
+                                        key=f"delete_prompt_{item['_id']}",
+                                        use_container_width=True,
+                                ):
+                                    response = requests.delete(
+                                        f"{API_BASE_URL}/prompt_history/{item['_id']}"
+                                    )
+
+                                    if response.status_code == 200:
+                                        st.success("Risposta eliminata.")
+                                        st.rerun()
+                                    else:
+                                        st.error("Errore durante l'eliminazione.")
                             st.markdown(f"**Data richiesta:** {item['request_date']}")
 
                             st.markdown(
@@ -402,6 +442,12 @@ with tab_intelligenza_art:
                             st.markdown(f"**Camere:** {camere}")
 
                             st.markdown(f"**Numero eventi:** {item['numero_eventi']}")
+
+                            tipi_eventi = ", ".join(item.get("tipi_eventi", [])) if item.get("tipi_eventi") else "Tutti"
+
+                            st.markdown(f"**Tipi evento:** {tipi_eventi}")
+
+                            st.markdown(f"**LLM:** {item.get('LLM', 'N/D')}")
 
                             st.markdown("### Prompt dell'utente")
 

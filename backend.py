@@ -675,25 +675,36 @@ async def generate_summary(req: SummaryRequest):
 
     sintesi = await call_llm(prompt, n_events=len(events))
 
+    llm_backend_label = (
+        f"OpenAI ({OPENAI_MODEL})"
+        if LLM_PROVIDER == "openai"
+        else f"Ollama ({OLLAMA_MODEL}) @ {OLLAMA_BASE_URL}"
+    )
+
+    event_types = sorted({
+        e.get(FIELD_TYPE)
+        for e in events
+        if e.get(FIELD_TYPE)
+    })
+
     if req.custom_prompt and req.custom_prompt.strip():
         await salva_risposta_prompt(
             req,
             end,
             len(events),
             sintesi,
+            llm_backend_label,
+            event_types,
         )
         return {"summary": sintesi}
 
-    llm_backend_label = (
-        f"OpenAI ({OPENAI_MODEL})"
-        if LLM_PROVIDER == "openai"
-        else f"Ollama ({OLLAMA_MODEL}) @ {OLLAMA_BASE_URL}"
-    )
     await salva_risposta_analisi(
         req,
         end,
         len(events),
         sintesi,
+        llm_backend_label,
+        event_types,
     )
     return {
         "period": {"start": req.start.isoformat(), "end": end.isoformat()},
@@ -710,16 +721,20 @@ async def salva_risposta_analisi(
     req,
     end,
     total_events,
-    risposta
+    risposta,
+    llm_backend,
+    event_types
 ):
     documento = {
         "request_date": datetime.now(timezone.utc),
         "camera_ids": req.camera_ids,
         "numero_eventi": total_events,
+        "tipi_eventi": event_types,
         "data_inizio": req.start.date().isoformat(),
         "data_fine": end.date().isoformat(),
         "ora_inizio": req.start.time().isoformat(timespec="seconds"),
         "ora_fine": end.time().isoformat(timespec="seconds"),
+        "LLM": llm_backend,
         "risposta": risposta,
     }
 
@@ -730,17 +745,21 @@ async def salva_risposta_prompt(
     req,
     end,
     total_events,
-    risposta
+    risposta,
+    llm_backend,
+    event_types
 ):
     documento = {
         "request_date": datetime.now(timezone.utc),
         "camera_ids": req.camera_ids,
         "numero_eventi": total_events,
+        "tipi_eventi": event_types,
         "data_inizio": req.start.date().isoformat(),
         "data_fine": end.date().isoformat(),
         "ora_inizio": req.start.time().isoformat(timespec="seconds"),
         "ora_fine": end.time().isoformat(timespec="seconds"),
         "prompt": req.custom_prompt,
+        "LLM": llm_backend,
         "risposta": risposta,
     }
 
@@ -778,3 +797,38 @@ async def prompt_history():
         risultati.append(doc)
 
     return risultati
+
+#metodi per cancellare una risposta dalla relativa collezione
+@app.delete("/analysis_history/{analysis_id}")
+async def delete_analysis(analysis_id: str):
+
+    try:
+        oid = ObjectId(analysis_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID non valido")
+
+    result = await analysis_collection.delete_one(
+        {"_id": oid}
+    )
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Analisi non trovata")
+
+    return {"status": "deleted"}
+
+@app.delete("/prompt_history/{prompt_id}")
+async def delete_prompt(prompt_id: str):
+
+    try:
+        oid = ObjectId(prompt_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID non valido")
+
+    result = await prompt_collection.delete_one(
+        {"_id": oid}
+    )
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Prompt non trovato")
+
+    return {"status": "deleted"}
