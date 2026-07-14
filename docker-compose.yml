@@ -81,6 +81,24 @@ services:
     networks:
       - rete_sorveglianza
 
+# 6. worker per analisi automatica.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: worker
+    env_file:
+      - .env
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    networks:
+      - rete_sorveglianza
+    restart: unless-stopped
+
+
 networks:
   rete_sorveglianza:
     driver: bridge

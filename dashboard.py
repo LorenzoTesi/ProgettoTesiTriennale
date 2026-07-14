@@ -13,6 +13,7 @@ import streamlit as st
 import requests
 import pandas as pd
 from datetime import datetime, date, time
+from zoneinfo import ZoneInfo
 import os
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
@@ -20,6 +21,19 @@ st.set_page_config(
     page_title="Sistema Sorveglianza Intelligente",
     layout="wide",
 )
+
+# Definizione del fuso orario di Roma
+FUSO_ROMA = ZoneInfo("Europe/Rome")
+
+
+# Converte stringhe ISO UTC provenienti da MongoDB nel fuso orario di Roma
+def converti_a_roma(dt_str):
+    try:
+        # Sostituisce la Z finale con +00:00 per renderla leggibile da fromisoformat
+        dt_utc = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        return dt_utc.astimezone(FUSO_ROMA)
+    except Exception:
+        return None
 
 
 # funzioni chiamata API
@@ -65,6 +79,69 @@ def generate_summary(payload):
     except Exception as e:
         st.error(f"Errore connessione LLM: {e}")
     return None
+
+
+def create_automation_job(payload):
+    try:
+        r = requests.post(f"{API_BASE_URL}/automation_jobs", json=payload, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError as e:
+        st.error(f"Errore creazione job periodico: {e.response.text}")
+    except Exception as e:
+        st.error(f"Errore connessione: {e}")
+    return None
+
+
+def get_automation_jobs():
+    try:
+        r = requests.get(f"{API_BASE_URL}/automation_jobs", timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError as e:
+        st.error(f"Errore recupero job periodici: {e.response.text}")
+    except Exception as e:
+        st.error(f"Errore connessione: {e}")
+    return None
+
+
+def pause_automation_job(job_id):
+    try:
+        r = requests.post(f"{API_BASE_URL}/automation_jobs/{job_id}/pause", timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError as e:
+        st.error(f"Errore durante la pausa del job: {e.response.text}")
+    except Exception as e:
+        st.error(f"Errore connessione: {e}")
+    return None
+
+
+def resume_automation_job(job_id):
+    try:
+        r = requests.post(f"{API_BASE_URL}/automation_jobs/{job_id}/resume", timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError as e:
+        st.error(f"Errore durante la ripresa del job: {e.response.text}")
+    except Exception as e:
+        st.error(f"Errore connessione: {e}")
+    return None
+
+
+def format_periodo(data_inizio, data_fine, ora_inizio, ora_fine):
+    # Mostra l'intervallo temporale esattamente così come inserito o salvato, senza applicare conversioni di fuso.
+    st.markdown(f"**Intervallo date:** {data_inizio} → {data_fine}")
+    st.markdown(f"**Intervallo orario:** {ora_inizio} → {ora_fine}")
+
+
+def get_event_by_id(event_id):
+    try:
+        r = requests.get(f"{API_BASE_URL}/events/{event_id}", timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
 
 
 # Inizializza lo stato delle telecamere nel session_state se non esiste già
@@ -155,7 +232,6 @@ if event_type != "tutti":
 if camere_attive:
     params["camera_ids"] = camere_attive
 
-
 if load_button:
     with st.spinner("Recupero eventi dal backend..."):
         data = get_events(params)
@@ -171,7 +247,9 @@ if load_button:
                 stats_params["camera_ids"] = camere_attive
             st.session_state.loaded_stats = get_stats(stats_params)
 
-tab_dashboard, tab_intelligenza_art, tab_responses = st.tabs(["Monitoraggio Eventi ", " Analisi e Sintesi AI"," Visualizza risposte"])
+tab_dashboard, tab_intelligenza_art, tab_responses, tab_scheduler = st.tabs(
+    ["Monitoraggio Eventi ", " Analisi e Sintesi AI", " Visualizza risposte passate",
+     " Visualizza risposte da scheduler periodici"])
 
 # Tab 1: Visualizzazione dati
 with tab_dashboard:
@@ -223,7 +301,7 @@ with tab_dashboard:
                 cols = st.columns([2, 1.5, 2, 1.2, 3, 1, 1.2])
 
 
-                #se l'evento è escluso viene sbarrato
+                # se l'evento è escluso viene sbarrato
                 def cell(col, testo, escluso):
                     if escluso:
                         col.markdown(f"<span style='color:#cc3333; text-decoration:line-through;'>**{testo}**</span>",
@@ -232,7 +310,14 @@ with tab_dashboard:
                         col.markdown(str(testo))
 
 
-                cell(cols[0], row["timestamp"][11:16] + " " + row["timestamp"][:10], escluso)
+                # Conversione del timestamp dell'evento reale (UTC da DB) al fuso orario di Roma prima del rendering
+                dt_roma = converti_a_roma(row["timestamp"])
+                if dt_roma:
+                    testo_data = dt_roma.strftime("%H:%M  %d/%m/%Y")
+                else:
+                    testo_data = row["timestamp"][11:16] + " " + row["timestamp"][:10]
+
+                cell(cols[0], testo_data, escluso)
                 cell(cols[1], row["camera"], escluso)
                 cell(cols[2], row["location"], escluso)
                 cell(cols[3], row["event_type"], escluso)
@@ -261,48 +346,101 @@ with tab_intelligenza_art:
     tasto_standard = st.button("Avvia Elaborazione Sintesi Standard")
     user_custom_prompt = st.chat_input("Scrivi qui cosa vuoi chiedere a Ollama riguardo agli eventi...")
 
+    st.divider()
+    st.markdown("**Modalità automatica (job periodico)**")
+    col_switch, col_freq = st.columns([1, 2])
+    with col_switch:
+        label_toggle = "Disattiva" if st.session_state.get("auto_job_toggle", False) else "Attiva"
+        modalita_automatica_on = st.toggle(label_toggle, key="auto_job_toggle")
+    with col_freq:
+        interval_minutes = st.number_input(
+            "Frequenza (minuti)",
+            min_value=1,
+            step=1,
+            value=None,
+            placeholder="Es. 30",
+            disabled=not modalita_automatica_on,
+            key="auto_job_interval",
+        )
+
+    titolo_job = st.text_input(
+        "Titolo job (opzionale)",
+        value="",
+        placeholder="Es. Monitoraggio ingresso notturno",
+        disabled=not modalita_automatica_on,
+        key="auto_job_titolo",
+    )
+
+    modalita_automatica = bool(modalita_automatica_on) and bool(interval_minutes)
+
     if tasto_standard or user_custom_prompt:
-        eventi_caricati = st.session_state.get("loaded_events", [])
-        esclusi = st.session_state.get("excluded_events", set())
 
-        # Filtra via gli eventi che l'utente ha escluso
-        eventi_inclusi = [e for e in eventi_caricati if e["_id"] not in esclusi]
+        if modalita_automatica:
+            tipi_evento_job = [] if event_type == "tutti" else [event_type]
+            esclusi = st.session_state.get("excluded_events", set())
 
-        if not eventi_caricati:
-            st.warning("Carica prima gli eventi dal tab 'Monitoraggio Eventi' utilizzando i filtri laterali.")
-        elif not eventi_inclusi:
-            st.warning(
-                "Tutti gli eventi caricati sono stati esclusi. Ripristina almeno un evento prima di avviare l'analisi.")
-        else:
-            n_esclusi = len(esclusi)
-            if n_esclusi > 0:
-                st.info(
-                    f"L'analisi verrà eseguita su **{len(eventi_inclusi)}** eventi ({n_esclusi} esclusi manualmente e non inviati al modello).")
-
-            payload = {
+            job_payload = {
+                "camera_ids": camere_attive,
+                "tipi_evento": tipi_evento_job,
+                "custom_prompt": user_custom_prompt if user_custom_prompt else None,
+                "titolo": titolo_job.strip() if titolo_job and titolo_job.strip() else None,
+                "max_events": limit,
+                "interval_minutes": int(interval_minutes),
+                "excluded_ids": list(esclusi),
                 "start": start_dt.isoformat(),
                 "end": end_dt.isoformat(),
-                "custom_prompt": user_custom_prompt if user_custom_prompt else None,
-                "selected_events": eventi_inclusi,
             }
-            if camere_attive:
-                payload["camera_ids"] = camere_attive
 
-            msg_caricamento = (
-                "Ollama sta generando la sintesi standard..."
-                if not user_custom_prompt
-                else f"Ollama sta elaborando: '{user_custom_prompt}'..."
-            )
+            with st.spinner("Creazione job periodico in corso..."):
+                job_result = create_automation_job(job_payload)
 
-            with st.spinner(msg_caricamento):
-                summary_data = generate_summary(payload)
+            if job_result:
+                st.success(
+                    f"Job periodico creato: verrà eseguito ogni {int(interval_minutes)} minuti. "
+                    f"Consulta i risultati nella tab 'Visualizza risposte da scheduler periodici'."
+                )
+        else:
+            eventi_caricati = st.session_state.get("loaded_events", [])
+            esclusi = st.session_state.get("excluded_events", set())
 
-                if summary_data:
-                    st.success("Elaborazione completata!")
-                    st.subheader("Analisi di Ollama")
-                    st.markdown(summary_data["summary"])
+            # Filtra via gli eventi che l'utente ha escluso
+            eventi_inclusi = [e for e in eventi_caricati if e["_id"] not in esclusi]
 
-#Tab 3 log delle risposte passate
+            if not eventi_caricati:
+                st.warning("Carica prima gli eventi dal tab 'Monitoraggio Eventi' utilizzando i filtri laterali.")
+            elif not eventi_inclusi:
+                st.warning(
+                    "Tutti gli eventi caricati sono stati esclusi. Ripristina almeno un evento prima di avviare l'analisi.")
+            else:
+                n_esclusi = len(esclusi)
+                if n_esclusi > 0:
+                    st.info(
+                        f"L'analisi verrà eseguita su **{len(eventi_inclusi)}** eventi ({n_esclusi} esclusi manualmente e non inviati al modello).")
+
+                payload = {
+                    "start": start_dt.isoformat(),
+                    "end": end_dt.isoformat(),
+                    "custom_prompt": user_custom_prompt if user_custom_prompt else None,
+                    "selected_events": eventi_inclusi,
+                }
+                if camere_attive:
+                    payload["camera_ids"] = camere_attive
+
+                msg_caricamento = (
+                    "Ollama sta generando la sintesi standard..."
+                    if not user_custom_prompt
+                    else f"Ollama sta elaborando: '{user_custom_prompt}'..."
+                )
+
+                with st.spinner(msg_caricamento):
+                    summary_data = generate_summary(payload)
+
+                    if summary_data:
+                        st.success("Elaborazione completata!")
+                        st.subheader("Analisi di Ollama")
+                        st.markdown(summary_data["summary"])
+
+    # Tab 3 log delle risposte passate
     with tab_responses:
 
         st.subheader("Log delle risposte")
@@ -313,22 +451,19 @@ with tab_intelligenza_art:
         left, center, right = st.columns([1, 2, 1])
 
         with center:
-
             c1, c2 = st.columns(2)
 
-            with c1:
-                if st.button(
-                        "Sintesi passate",
-                        use_container_width=True,
-                ):
-                    st.session_state.history_view = "analysis"
+        with c1:
+            btn_type_analysis = "primary" if st.session_state.history_view == "analysis" else "secondary"
+            if st.button("Sintesi passate", use_container_width=True, type=btn_type_analysis):
+                st.session_state.history_view = "analysis"
+                st.rerun()
 
-            with c2:
-                if st.button(
-                        "Risposte ai prompt",
-                        use_container_width=True,
-                ):
-                    st.session_state.history_view = "prompt"
+        with c2:
+            btn_type_prompt = "primary" if st.session_state.history_view == "prompt" else "secondary"
+            if st.button("Risposte ai prompt", use_container_width=True, type=btn_type_prompt):
+                st.session_state.history_view = "prompt"
+                st.rerun()
 
         st.divider()
 
@@ -345,11 +480,12 @@ with tab_intelligenza_art:
                 else:
 
                     for item in storico:
-                        dt = datetime.fromisoformat(item["request_date"].replace("Z", "+00:00"))
-                        titolo = dt.strftime(" %d/%m/%Y  %H:%M")
+                        # Conversione a fuso orario di Roma della data in cui è stata fatta la richiesta
+                        dt_roma = converti_a_roma(item["request_date"])
+                        titolo = dt_roma.strftime(" %d/%m/%Y  %H:%M") if dt_roma else " Data N/D"
 
                         with st.expander(titolo):
-                            _, col_delete = st.columns([10, 1])
+                            _, col_delete = st.columns([10, 2])
 
                             with col_delete:
                                 if st.button(
@@ -366,12 +502,15 @@ with tab_intelligenza_art:
                                         st.rerun()
                                     else:
                                         st.error("Errore durante l'eliminazione.")
-                            st.markdown(f"**Data richiesta:** {item['request_date']}")
 
-                            st.markdown(
-                                f"**Periodo analizzato:** "
-                                f"{item['data_inizio']} {item['ora_inizio']} → "
-                                f"{item['data_fine']} {item['ora_fine']}"
+                            data_richiesta_roma = dt_roma.strftime("%Y-%m-%d %H:%M:%S") if dt_roma else item[
+                                'request_date']
+                            st.markdown(f"**Data richiesta:** {data_richiesta_roma}")
+
+                            # Mostra l'intervallo temporale salvato così com'è, senza raddoppiare la conversione fuso
+                            format_periodo(
+                                item["data_inizio"], item["data_fine"],
+                                item["ora_inizio"], item["ora_fine"],
                             )
 
                             camere = ", ".join(item["camera_ids"]) if item["camera_ids"] else "Tutte"
@@ -404,15 +543,16 @@ with tab_intelligenza_art:
                 storico = response.json()
 
                 if not storico:
-                    st.info("Non sono presenti prompt salvati.")
+                    st.info("Non sono presenti risposte a prompt salvate.")
                 else:
 
                     for item in storico:
-                        dt = datetime.fromisoformat(item["request_date"].replace("Z", "+00:00"))
-                        titolo = dt.strftime(" %d/%m/%Y  %H:%M")
+                        # Conversione a fuso orario di Roma della data della richiesta
+                        dt_roma = converti_a_roma(item["request_date"])
+                        titolo = dt_roma.strftime(" %d/%m/%Y  %H:%M") if dt_roma else " Data N/D"
 
                         with st.expander(titolo):
-                            _, col_delete = st.columns([10, 1])
+                            _, col_delete = st.columns([10, 2])
 
                             with col_delete:
                                 if st.button(
@@ -429,12 +569,15 @@ with tab_intelligenza_art:
                                         st.rerun()
                                     else:
                                         st.error("Errore durante l'eliminazione.")
-                            st.markdown(f"**Data richiesta:** {item['request_date']}")
 
-                            st.markdown(
-                                f"**Periodo analizzato:** "
-                                f"{item['data_inizio']} {item['ora_inizio']} → "
-                                f"{item['data_fine']} {item['ora_fine']}"
+                            data_richiesta_roma = dt_roma.strftime("%Y-%m-%d %H:%M:%S") if dt_roma else item[
+                                'request_date']
+                            st.markdown(f"**Data richiesta:** {data_richiesta_roma}")
+
+                            # Mostra l'intervallo richiesto così com'è
+                            format_periodo(
+                                item["data_inizio"], item["data_fine"],
+                                item["ora_inizio"], item["ora_fine"],
                             )
 
                             camere = ", ".join(item["camera_ids"]) if item["camera_ids"] else "Tutte"
@@ -461,6 +604,175 @@ with tab_intelligenza_art:
 
             else:
                 st.error("Errore durante il recupero dei prompt.")
+
+    with tab_scheduler:
+
+        st.subheader("Job di automated periodica")
+
+        jobs = get_automation_jobs()
+
+        if jobs is None:
+            pass
+        elif not jobs:
+            st.info("Non sono presenti job periodici configurati.")
+        else:
+            for job in jobs:
+                job_id = job["_id"]
+
+                ultima_modifica_raw = job.get("ultima_modifica")
+                if ultima_modifica_raw:
+                    dt_mod = converti_a_roma(ultima_modifica_raw)
+                    data_titolo = dt_mod.strftime(" %d/%m/%Y  %H:%M") if dt_mod else " (data non disponibile)"
+                else:
+                    data_titolo = " (data non disponibile)"
+
+                titolo_personalizzato = (job.get("titolo") or "").strip()
+                titolo = f" {titolo_personalizzato}" if titolo_personalizzato else data_titolo
+
+                job_enabled = job.get("enabled", True)
+                titolo = titolo + ("" if job_enabled else "  ⏸ in pausa")
+
+                with st.expander(titolo):
+                    _, col_pause, col_delete = st.columns([8, 2, 2])
+
+                    with col_pause:
+                        if job_enabled:
+                            if st.button(
+                                    "⏸ Pausa",
+                                    key=f"pause_job_{job_id}",
+                                    use_container_width=True,
+                            ):
+                                if pause_automation_job(job_id):
+                                    st.success("Job messo in pausa.")
+                                    st.rerun()
+                        else:
+                            if st.button(
+                                    "▶ Avvia",
+                                    key=f"resume_job_{job_id}",
+                                    use_container_width=True,
+                            ):
+                                if resume_automation_job(job_id):
+                                    st.success("Job riavviato.")
+                                    st.rerun()
+
+                    with col_delete:
+                        if st.button(
+                                "Elimina",
+                                key=f"delete_job_{job_id}",
+                                use_container_width=True,
+                        ):
+                            response = requests.delete(f"{API_BASE_URL}/automation_jobs/{job_id}")
+
+                            if response.status_code == 200:
+                                st.success("Job eliminato.")
+                                st.rerun()
+                            else:
+                                st.error("Errore durante l'eliminazione.")
+
+                    if not job_enabled:
+                        st.warning("Questo job è in pausa: non verrà eseguito finché non viene riavviato.")
+
+                    if titolo_personalizzato:
+                        st.markdown(f"**Ultima modifica:**{data_titolo}")
+
+                    job_start_raw = job.get("start")
+                    job_end_raw = job.get("end")
+                    if job_start_raw and job_end_raw:
+
+                        try:
+                            parti_start = job_start_raw.split("T")
+                            parti_end = job_end_raw.split("T")
+                            format_periodo(
+                                parti_start[0], parti_end[0],
+                                parti_start[1][:8], parti_end[1][:8]
+                            )
+                        except Exception:
+                            format_periodo(job_start_raw, job_end_raw, "", "")
+
+                    camere = ", ".join(job.get("camera_ids", [])) if job.get("camera_ids") else "Tutte"
+                    st.markdown(f"**Telecamere incluse:** {camere}")
+
+                    tipi_eventi = ", ".join(job.get("tipi_evento", [])) if job.get("tipi_evento") else "Tutti"
+                    st.markdown(f"**Tipi evento:** {tipi_eventi}")
+
+                    st.markdown(f"**LLM:** {job.get('modello_LLM') or 'N/D (nessun ciclo completato ancora)'}")
+
+                    if job.get("custom_prompt"):
+                        st.markdown("**Prompt personalizzato:**")
+                        st.info(job["custom_prompt"])
+
+                    st.markdown(f"**Frequenza:** ogni {job.get('interval_minutes', 'N/D')} minuti")
+
+                    ultima_esecuzione_raw = job.get("ultima_esecuzione")
+                    if ultima_esecuzione_raw:
+                        dt_ultima_esecuzione = converti_a_roma(str(ultima_esecuzione_raw))
+                        st.markdown(
+                            f"**Ultimo iter eseguito:** "
+                            f"{dt_ultima_esecuzione.strftime('%d/%m/%Y %H:%M:%S')}" if dt_ultima_esecuzione else "N/D"
+                        )
+                    else:
+                        st.markdown("**Ultimo iter eseguito:** nessuno ancora")
+
+                    ultimo_esito = job.get("ultimo_esito")
+                    if ultimo_esito:
+                        if ultimo_esito.startswith("OK"):
+                            st.caption(f"Esito: {ultimo_esito}")
+                        else:
+                            st.warning(f"Esito: {ultimo_esito}")
+
+                    st.divider()
+                    st.markdown("### Risposta")
+                    risposta = job.get("risposta")
+                    if risposta:
+                        st.write(risposta)
+                    else:
+                        st.caption("Nessuna risposta ancora generata: il job non ha eseguito il primo ciclo.")
+
+                    st.divider()
+
+                    esclusi_ids = job.get("id_eventi_esclusi", []) or []
+                    st.markdown(f"### Eventi esclusi manualmente ({len(esclusi_ids)})")
+
+                    if not esclusi_ids:
+                        st.caption("Nessun evento escluso manualmente per questo job.")
+                    else:
+                        for ev_id in esclusi_ids:
+                            ev = get_event_by_id(ev_id)
+
+                            with st.container(border=True):
+                                col_incl, col_info = st.columns([1, 5])
+
+                                with col_incl:
+                                    if st.button(
+                                            "✓ includi",
+                                            key=f"reinclude_{job_id}_{ev_id}",
+                                            use_container_width=True,
+                                    ):
+                                        r = requests.post(
+                                            f"{API_BASE_URL}/automation_jobs/{job_id}/reinclude/{ev_id}"
+                                        )
+                                        if r.status_code == 200:
+                                            st.success("Evento reincluso.")
+                                            st.rerun()
+                                        else:
+                                            st.error("Errore durante la reinclusione.")
+
+                                with col_info:
+                                    if ev is None:
+                                        st.caption(f"Evento {ev_id} non trovato (potrebbe essere stato eliminato).")
+                                    else:
+                                        tags = ev.get("metadata", {}).get("tags", [])
+                                        dt_ev_roma = converti_a_roma(ev.get('timestamp', ''))
+                                        testo_data_ev = dt_ev_roma.strftime(
+                                            '%d/%m/%Y %H:%M:%S') if dt_ev_roma else ev.get('timestamp', 'N/D')
+
+                                        st.markdown(
+                                            f"**Data:** {testo_data_ev}  \n"
+                                            f"**Location:** {ev.get('location', 'N/D')}  \n"
+                                            f"**Tipo:** {ev.get('event_type', 'N/D')}  \n"
+                                            f"**Descrizione:** {ev.get('description', 'N/D')}  \n"
+                                            f"**Tags:** {', '.join(tags) if tags else 'Nessuno'}"
+                                        )
 
     st.divider()
 

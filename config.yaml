@@ -57,7 +57,7 @@ security_rules:
 # Limiti applicativi
 limits:
   max_events: 1000       # limite massimo assoluto richiedibile su /events
-  default_events: 100    # limite di default se non specificato
+  default_events: 100   # limite di default se non specificato
 
 # Indici MongoDB creati all'avvio del backend
 mongo_indexes:
@@ -73,20 +73,20 @@ llm:
 
   # Parametri di generazione di default
   temperature: 0.1
-  min_num_ctx: 2048
-  min_output_tokens: 2048
-  tokens_per_event: 80
+  min_num_ctx: 4096
+  min_output_tokens: 4096
+  tokens_per_event: 100
 
   prompts:
     custom_intro: >-
       Sei un sistema di intelligenza artificiale per la sicurezza. Il tuo compito è
       leggere attentamente la lista degli eventi riportata sotto, comprenderne il
       significato e rispondere alla richiesta dell'operatore in modo diretto,
-      preciso e conciso.
+      preciso e conciso. Considera ogni evento descritto come indipendente dagli altri.
     summary_intro: >-
-      Sei un sistema di analisi della sicurezza per {domain_description}. Il tuo
+      Sei un sistema di analisi della sicurezza per sicurezza. Il tuo
       compito è classificare ogni evento osservato tenendo conto dell'orario, del
-      luogo e del tipo di soggetto.
+      luogo e del tipo di soggetto. Considera ogni evento descritto come indipendente dagli altri.
 
   # Categorie di classificazione
   categories:
@@ -106,7 +106,7 @@ llm:
       guida: "evento completamente normale per orario, zona e soggetto."
       esempio_motivo: "conferma normalità"
 
-# Schema del dataset eventi
+# Schema del dataset collezione eventi
 event_schema:
   timestamp_field: timestamp
   camera_field: camera_id

@@ -1,7 +1,8 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-from datetime import datetime, timedelta, time, timezone
+from datetime import datetime, timedelta, time
+from zoneinfo import ZoneInfo
 from typing import Optional
 from contextlib import asynccontextmanager
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -19,6 +20,7 @@ MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "sistema_eventi")
 MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "eventi_osservati")
 MONGO_ANALYSIS_COLLECTION = os.getenv("MONGO_ANALYSIS_COLLECTION","risposte_analisi")
 MONGO_PROMPT_COLLECTION = os.getenv("MONGO_PROMPT_COLLECTION","risposte_prompt")
+MONGO_SCHEDULER_COLLECTION = os.getenv("MONGO_SCHEDULER_COLLECTION", "risposte_job_periodico")
 
 
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
@@ -28,6 +30,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 CONFIG_PATH = os.getenv("CONFIG_PATH", "config.yaml")
+
+LOCAL_TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Rome"))
 
 VALID_LLM_PROVIDERS = {"ollama", "openai"}
 if LLM_PROVIDER not in VALID_LLM_PROVIDERS:
@@ -71,8 +75,8 @@ LLM_CONFIG = DOMAIN_CONFIG.get("llm", {})
 LLM_CATEGORIES = LLM_CONFIG.get("categories", [])
 LLM_LANGUAGE = LLM_CONFIG.get("language", "it")
 LLM_TEMPERATURE = LLM_CONFIG.get("temperature", 0.1)
-LLM_MIN_NUM_CTX = LLM_CONFIG.get("min_num_ctx", 2048)
-LLM_MIN_OUTPUT_TOKENS = LLM_CONFIG.get("min_output_tokens", 2048)
+LLM_MIN_NUM_CTX = LLM_CONFIG.get("min_num_ctx", 4096)
+LLM_MIN_OUTPUT_TOKENS = LLM_CONFIG.get("min_output_tokens", 4096)
 LLM_TOKENS_PER_EVENT = LLM_CONFIG.get("tokens_per_event", 80)
 LLM_RESPONSE_LANGUAGE = LLM_CONFIG.get("response_language_name", "italiano")
 LLM_DOMAIN_DESCRIPTION = LLM_CONFIG.get("domain_description", "una struttura")
@@ -100,11 +104,11 @@ def get_nested_field(doc: dict, dotted_field: str, default=None):
 
 PROMPT_CUSTOM_INTRO = LLM_PROMPTS.get(
     "custom_intro",
-    "Sei un sistema di intelligenza artificiale per la sicurezza."
+    "Sei un sistema di analisi per la sicurezza."
 )
 PROMPT_SUMMARY_INTRO = LLM_PROMPTS.get(
     "summary_intro",
-    "Sei un sistema di analisi della sicurezza per {domain_description}."
+    "Sei un sistema di analisi della sicurezza."
 ).format(domain_description=LLM_DOMAIN_DESCRIPTION)
 
 mongo_client = AsyncIOMotorClient(MONGO_DETAILS)
@@ -112,6 +116,7 @@ database     = mongo_client[MONGO_DB_NAME]
 collection   = database.get_collection(MONGO_COLLECTION_NAME)
 analysis_collection = database.get_collection(MONGO_ANALYSIS_COLLECTION)
 prompt_collection = database.get_collection(MONGO_PROMPT_COLLECTION)
+scheduler_collection = database.get_collection(MONGO_SCHEDULER_COLLECTION)
 
 # LIFECYCLE
 @asynccontextmanager
@@ -210,6 +215,40 @@ class SummaryRequest(BaseModel):
         return datetime.now().replace(hour=23, minute=59, second=59, microsecond=0)
 
 
+class AutomationJobCreate(BaseModel):
+    camera_ids: list[str] = Field(default_factory=list, description="Telecamere abilitate; vuoto = tutte")
+    tipi_evento: list[str] = Field(default_factory=list, description="Tipi evento da includere; vuoto = tutti")
+    custom_prompt: Optional[str] = Field(default=None, description="Prompt personalizzato opzionale")
+    titolo: Optional[str] = Field(default=None, description="Titolo descrittivo del job, opzionale")
+    max_events: int = Field(default=DEFAULT_EVENTS_LIMIT, ge=0, le=MAX_EVENTS_LIMIT)
+    interval_minutes: int = Field(..., gt=0, description="Frequenza di esecuzione in minuti")
+    excluded_ids: list[str] = Field(
+        default_factory=list,
+        description="_id di eventi da escludere fin dalla creazione del job (opzionale)"
+    )
+    start: datetime = Field(
+        ...,
+        description="Data e ora di inizio del periodo (stessa data+ora del form di analisi manuale)"
+    )
+    end: Optional[datetime] = Field(
+        default=None,
+        description="Data e ora di fine periodo. Se omesso, fine della giornata corrente."
+    )
+
+    def resolved_end(self) -> datetime:
+        if self.end is not None:
+            return self.end
+        return datetime.now().replace(hour=23, minute=59, second=59, microsecond=0)
+
+    @field_validator("tipi_evento")
+    @classmethod
+    def validate_tipi_evento(cls, v: list[str]) -> list[str]:
+        invalid = set(v) - ALLOWED_EVENT_TYPES
+        if invalid:
+            raise ValueError(f"tipi_evento non validi: {sorted(invalid)}. Ammessi: {sorted(ALLOWED_EVENT_TYPES)}")
+        return v
+
+
 # FUNZIONI DI UTILITY
 def event_to_doc(event: Event) -> dict:
     doc = event.model_dump()
@@ -262,12 +301,12 @@ def _build_time_query(start: datetime, end: datetime) -> dict:
 
     return {"$or": clauses}
 
-#dispatch tra Ollama locale e OpenAI cloud, in base a LLM_PROVIDER
+
 def _compute_generation_params(prompt: str, n_events: int) -> tuple[int, int]:
-    #calcolo dinamico dei token solo per Ollama
+    #calcolo dinamico dei token
     output_tokens = max(LLM_MIN_OUTPUT_TOKENS, n_events * LLM_TOKENS_PER_EVENT + 1024)
     prompt_tokens_estimate = max(LLM_MIN_NUM_CTX, len(prompt) // 4)
-    num_ctx = int((prompt_tokens_estimate + output_tokens) * 1.2)
+    num_ctx = int((prompt_tokens_estimate + output_tokens) * 1.3)
     ctx_power2 = 1
     while ctx_power2 < num_ctx:
         ctx_power2 *= 2
@@ -328,7 +367,7 @@ async def _call_openai(prompt: str, n_events: int) -> str:
     except Exception as e:
         return f"[Errore OpenAI] {type(e).__name__}: {e}"
 
-
+#dispatch tra Ollama locale e OpenAI cloud, in base a LLM_PROVIDER
 async def call_llm(prompt: str, n_events: int = 0) -> str:
     if LLM_PROVIDER == "openai":
         return await _call_openai(prompt, n_events)
@@ -386,12 +425,11 @@ async def check_llm_status() -> dict:
         return await check_openai_status()
     return await check_ollama_status()
 
-
+#metodo per costruire il prompt per analisi sistematica degli eventi
 def _build_summary_prompt(
     events: list[dict],
     start: datetime,
     end: datetime,
-    camera_ids: list[str],
 ) -> str:
     righe = []
     for e in events:
@@ -426,7 +464,7 @@ GUIDA ALLE CATEGORIE (usala per assegnare ogni evento):
 {guida_categorie_txt}
 
 REGOLE DI RISPOSTA:
- - HAI RICEVUTO ESATTAMENTE {n} EVENTI. DEVI CLASSIFICARNE ESATTAMENTE {n}. Né di più, né di meno.
+ - HAI RICEVUTO ESATTAMENTE {n} EVENTI. DEVI CLASSIFICARNE ESATTAMENTE {n}. TRALASCIARE UN EVENTO è UN GRAVE ERRORE.
  - OGNI EVENTO COMPARE UNA SOLA VOLTA nella risposta. Duplicare un evento è un errore CRITICO.
  - Assegna ogni evento alla sezione più appropriata in base a orario, zona e soggetto.
  - NON RISCRIVERE la lista di eventi in blocco.
@@ -445,6 +483,51 @@ Rispondi in {LLM_RESPONSE_LANGUAGE} con questa ESATTA struttura.
 
 Riepilogo:
 """
+
+#metodo per costruire il prompt per una richiesta personalizata
+def _build_custom_prompt(events: list[dict], custom_prompt: str) -> str:
+    righe_lista = []
+    for e in events:
+        tags = get_nested_field(e, FIELD_TAGS, [])
+        soggetto = "dipendente autorizzato" if EMPLOYEE_TAG in tags else "persona non autorizzata"
+        ts = e.get(FIELD_TIMESTAMP)
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        ora = ts.strftime("%H:%M")
+        camera_id = e.get(FIELD_CAMERA)
+        location = e.get(FIELD_LOCATION)
+        event_type_ = e.get(FIELD_TYPE)
+        description = e.get(FIELD_DESCRIPTION)
+        righe_lista.append(
+            f"- [{ora}] Camera: {camera_id} ({location}) | Tipo: {event_type_} | "
+            f"Soggetto: {soggetto} | Descrizione: {description}"
+        )
+    righe_eventi = "\n".join(righe_lista)
+
+    return (
+        f"{PROMPT_CUSTOM_INTRO}\n\n"
+        f"{CONTESTO_STRUTTURA}\n\n"
+        f"ISTRUZIONI ADDIZIONALI:\n"
+        f"- Se la richiesta implica un conteggio (es. 'quanti...'), analizza i testi, conta gli elementi corrispondenti e fornisci il risultato numerico.\n"
+        f"- Rispondi in {LLM_RESPONSE_LANGUAGE} e non ripetere l'intera lista degli eventi nella risposta.\n\n"
+        f"RICHIESTA OPERATORE: {custom_prompt}\n\n"
+        f"LISTA DEGLI EVENTI DA ANALIZZARE ({len(events)} totali):\n{righe_eventi}\n\n"
+    )
+
+#dispatcher per i due tipi di richieste all'LLM
+def build_llm_prompt(
+    events: list[dict],
+    start: datetime,
+    end: datetime,
+    camera_ids: list[str],
+    custom_prompt: Optional[str] = None,
+) -> str:
+
+    if custom_prompt and custom_prompt.strip():
+        return _build_custom_prompt(events, custom_prompt.strip())
+    return _build_summary_prompt(events, start, end, camera_ids)
+
+
 
 @app.get("/", tags=["Sistema"])
 def home():
@@ -512,13 +595,6 @@ async def get_events(
             FIELD_TYPE: event_type
         })
 
-    if location:
-        conditions.append({
-            FIELD_LOCATION: {
-                "$regex": location,
-                "$options": "i"
-            }
-        })
     query = {"$and": conditions}
     cursor = collection.find(query).sort(FIELD_TIMESTAMP, 1)
 
@@ -563,24 +639,6 @@ async def delete_event(event_id: str):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Evento non trovato")
     return {"status": "deleted", "id": event_id}
-
-
-@app.delete("/events", tags=["Eventi"])
-async def delete_events_in_range(
-    start:      datetime            = Query(...),
-    end:        datetime            = Query(...),
-    camera_ids: Optional[list[str]] = Query(None),
-):
-    if end <= start:
-        raise HTTPException(status_code=400, detail="'end' deve essere successivo a 'start'")
-
-    query = _build_time_query(start, end)
-    if camera_ids:
-        query[FIELD_CAMERA] = {"$in": camera_ids}
-
-    result = await collection.delete_many(query)
-    return {"status": "deleted", "deleted_count": result.deleted_count}
-
 
 # ENDPOINT — STATISTICHE
 @app.get("/stats", tags=["Statistiche"])
@@ -643,42 +701,13 @@ async def generate_summary(req: SummaryRequest):
                 "Controlla che il simulatore abbia inviato eventi in questo intervallo."
             ),
         )
-
-    if req.custom_prompt and req.custom_prompt.strip():
-        righe_lista = []
-        for e in events:
-            tags = get_nested_field(e, FIELD_TAGS, [])
-            soggetto = "dipendente autorizzato" if EMPLOYEE_TAG in tags else "persona non autorizzata"
-            ts = e.get(FIELD_TIMESTAMP)
-            if isinstance(ts, str):
-                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            ora = ts.strftime("%H:%M")
-            camera_id   = e.get(FIELD_CAMERA)
-            location    = e.get(FIELD_LOCATION)
-            event_type_ = e.get(FIELD_TYPE)
-            description = e.get(FIELD_DESCRIPTION)
-            righe_lista.append(
-                f"- [{ora}] Camera: {camera_id} ({location}) | Tipo: {event_type_} | Soggetto: {soggetto} | Descrizione: {description}"
-            )
-        righe_eventi = "\n".join(righe_lista)
-        prompt = (
-            f"{PROMPT_CUSTOM_INTRO}\n\n"
-            f"{CONTESTO_STRUTTURA}\n\n"
-            f"ISTRUZIONI ADDIZIONALI:\n"
-            f"- Se la richiesta implica un conteggio (es. 'quanti...'), analizza i testi, conta gli elementi corrispondenti e fornisci il risultato numerico.\n"
-            f"- Rispondi in {LLM_RESPONSE_LANGUAGE} e non ripetere l'intera lista degli eventi nella risposta.\n\n"
-            f"RICHIESTA OPERATORE: {req.custom_prompt}\n\n"
-            f"LISTA DEGLI EVENTI DA ANALIZZARE ({len(events)} totali):\n{righe_eventi}\n\n"
-        )
-    else:
-        prompt = _build_summary_prompt(events, req.start, end, req.camera_ids)
-
+    prompt = build_llm_prompt(events,req.start, end, req.camera_ids, req.custom_prompt)
     sintesi = await call_llm(prompt, n_events=len(events))
 
     llm_backend_label = (
         f"OpenAI ({OPENAI_MODEL})"
         if LLM_PROVIDER == "openai"
-        else f"Ollama ({OLLAMA_MODEL}) @ {OLLAMA_BASE_URL}"
+        else f"Ollama ({OLLAMA_MODEL})"
     )
 
     event_types = sorted({
@@ -716,6 +745,8 @@ async def generate_summary(req: SummaryRequest):
     }
 
 
+
+
 #metodi per salvare le risposte in mongodb
 async def salva_risposta_analisi(
     req,
@@ -726,7 +757,7 @@ async def salva_risposta_analisi(
     event_types
 ):
     documento = {
-        "request_date": datetime.now(timezone.utc),
+        "request_date": datetime.now(LOCAL_TZ),
         "camera_ids": req.camera_ids,
         "numero_eventi": total_events,
         "tipi_eventi": event_types,
@@ -750,7 +781,7 @@ async def salva_risposta_prompt(
     event_types
 ):
     documento = {
-        "request_date": datetime.now(timezone.utc),
+        "request_date": datetime.now(LOCAL_TZ),
         "camera_ids": req.camera_ids,
         "numero_eventi": total_events,
         "tipi_eventi": event_types,
@@ -832,3 +863,122 @@ async def delete_prompt(prompt_id: str):
         raise HTTPException(status_code=404, detail="Prompt non trovato")
 
     return {"status": "deleted"}
+
+
+# ENDPOINT — ANALISI AUTOMATICA (job periodico gestito dal worker APScheduler)
+# NOTA: camera_ids, tipi_evento, custom_prompt, start/end, max_events e
+# interval_minutes sono FISSI alla creazione del job e non sono più modificabili.
+# L'unica azione consentita dopo la creazione è /reinclude, che rimuove un
+# evento dalla lista degli esclusi.
+
+@app.post("/automation_jobs", status_code=201, tags=["Automazione"])
+async def create_automation_job(req: AutomationJobCreate):
+    now = datetime.now(LOCAL_TZ)
+    documento = {
+        "camera_ids": req.camera_ids,
+        "tipi_evento": req.tipi_evento,
+        "custom_prompt": req.custom_prompt,
+        "titolo": req.titolo,
+        "max_events": req.max_events,
+        "interval_minutes": req.interval_minutes,
+        "start": req.start,
+        "end": req.resolved_end(),
+        "enabled": True,
+        "id_eventi_analizzati": [],
+        "id_eventi_esclusi": req.excluded_ids,
+        "risposta": "",
+        "modello_LLM": None,
+        "ultima_esecuzione": None,
+        "ultima_modifica": now,
+        "creato_il": now,
+    }
+    result = await scheduler_collection.insert_one(documento)
+    return {"status": "created", "id": str(result.inserted_id)}
+
+
+@app.get("/automation_jobs", tags=["Automazione"])
+async def list_automation_jobs():
+    risultati = []
+    cursor = scheduler_collection.find().sort("ultima_modifica", -1)
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        risultati.append(doc)
+    return risultati
+
+
+@app.get("/automation_jobs/{job_id}", tags=["Automazione"])
+async def get_automation_job(job_id: str):
+    try:
+        oid = ObjectId(job_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID non valido")
+
+    doc = await scheduler_collection.find_one({"_id": oid})
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Job non trovato")
+    doc["_id"] = str(doc["_id"])
+    return doc
+
+
+@app.delete("/automation_jobs/{job_id}", tags=["Automazione"])
+async def delete_automation_job(job_id: str):
+    try:
+        oid = ObjectId(job_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID non valido")
+
+    result = await scheduler_collection.delete_one({"_id": oid})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Job non trovato")
+    return {"status": "deleted"}
+
+
+@app.post("/automation_jobs/{job_id}/pause", tags=["Automazione"])
+async def pause_automation_job(job_id: str):
+    try:
+        oid = ObjectId(job_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID job non valido")
+
+    result = await scheduler_collection.update_one(
+        {"_id": oid},
+        {"$set": {"enabled": False, "ultima_modifica": datetime.now(LOCAL_TZ)}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Job non trovato")
+    return {"status": "paused"}
+
+
+@app.post("/automation_jobs/{job_id}/resume", tags=["Automazione"])
+async def resume_automation_job(job_id: str):
+    try:
+        oid = ObjectId(job_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID job non valido")
+
+    result = await scheduler_collection.update_one(
+        {"_id": oid},
+        {"$set": {"enabled": True, "ultima_modifica": datetime.now(LOCAL_TZ)}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Job non trovato")
+    return {"status": "resumed"}
+
+
+@app.post("/automation_jobs/{job_id}/reinclude/{event_id}", tags=["Automazione"])
+async def reinclude_event(job_id: str, event_id: str):
+    try:
+        oid = ObjectId(job_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID job non valido")
+
+    result = await scheduler_collection.update_one(
+        {"_id": oid},
+        {
+            "$pull": {"id_eventi_esclusi": event_id},
+            "$set": {"ultima_modifica": datetime.now(LOCAL_TZ)},
+        }
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Job non trovato")
+    return {"status": "reincluded", "event_id": event_id}
