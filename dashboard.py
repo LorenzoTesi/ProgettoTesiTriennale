@@ -1,42 +1,233 @@
-# Dashboard Streamlit per:
-# - visualizzare eventi
-# - filtrare per data/camera/tipo
-# - generare sintesi LLM via Ollama locale o fare richieste personalizzate
-#
-# AVVIO:
-# streamlit run dashboard.py
-#
-# Assicurarsi che il backend FastAPI sia acceso:
-# uvicorn backend:app --reload
-
 import streamlit as st
+from streamlit import container
 import requests
 import pandas as pd
-from datetime import datetime, date, time
+import yaml
+import time as pytime
+from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
 import os
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+CONFIG_PATH = os.getenv("CONFIG_PATH", "config.yaml")
+
 st.set_page_config(
     page_title="Sistema Sorveglianza Intelligente",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# Definizione del fuso orario di Roma
 FUSO_ROMA = ZoneInfo("Europe/Rome")
 
+BADGE = {
+    "Critico": "🔴 Critico",
+    "Alto": "🟠 Alto",
+    "Medio": "🟡 Medio",
+    "Basso": "🟢 Basso",
+    "N/D": "⚪ N/D",
+}
 
-# Converte stringhe ISO UTC provenienti da MongoDB nel fuso orario di Roma
+# ──────────────────────────────────────────────────────────────────────────
+# CSS PERSONALIZZATO (Responsive layout & pulizia pulsanti)
+# ──────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+div[data-testid="stMetric"] {
+    background-color: rgba(120,120,120,0.06);
+    border: 1px solid rgba(120,120,120,0.18);
+    border-radius: 10px;
+    padding: 14px 16px 10px 16px;
+}
+.critical-box {
+    border: 1px solid rgba(220,50,50,0.5);
+    background-color: rgba(220,50,50,0.06);
+    border-radius: 10px;
+    padding: 14px 18px;
+}
+
+/* Permette al testo nelle celle di andare a capo invece di sovrapporsi
+   quando lo spazio orizzontale è stretto (fix collasso testo su mobile) */
+div[data-testid="stColumn"] {
+    white-space: normal !important;
+    overflow-wrap: break-word !important;
+    word-break: break-word !important;
+}
+
+/* Riduzione padding interno per layout responsive */
+div[data-testid="stColumn"] > div {
+    padding-left: 4px !important;
+    padding-right: 4px !important;
+}
+
+/* Le etichette delle colonne nell'intestazione restano su una riga sola */
+div[class*="st-key-table_header"] .col-label {
+    white-space: nowrap;
+    font-weight: 600;
+}
+
+/* Frecce di ordinamento compatte, impilate accanto al nome colonna */
+div[class*="st-key-sort_"] {
+    line-height: 1 !important;
+}
+div[class*="st-key-sort_"] button {
+    padding: 0px 3px !important;
+    min-height: 15px !important;
+    height: 15px !important;
+    width: 100% !important;
+    font-size: 8px !important;
+    line-height: 1 !important;
+    margin: 0px 0px 2px 0px !important;
+    border-radius: 3px !important;
+}
+div[class*="st-key-sort_"]:last-child button {
+    margin-bottom: 0px !important;
+}
+
+/* Pulsante escludi/Includi compatto e senza a capo */
+.btn-action button {
+    padding: 2px 6px !important;
+    font-size: 12px !important;
+    min-height: 28px !important;
+    height: auto !important;
+    white-space: nowrap !important;
+}
+
+/* Riga di "schede" di analisi: scorrimento orizzontale forzato */
+div[data-testid="stHorizontalBlock"]:has(div[class*="st-key-scheda_"]) {
+    display: flex !important;
+    flex-direction: row !important;
+    flex-wrap: nowrap !important;
+    overflow-x: auto !important;
+    gap: 8px !important;
+    padding-bottom: 10px !important;
+}
+
+/* Disabilita la riduzione e la crescita forzata delle colonne all'interno della riga schede */
+div[data-testid="stHorizontalBlock"]:has(div[class*="st-key-scheda_"]) > div[data-testid="stColumn"] {
+    flex: 0 0 auto !important;
+    min-width: 140px !important;
+    max-width: 220px !important;
+    width: auto !important;
+}
+
+/* Stile pulsanti schede */
+div[class*="st-key-scheda_"] button {
+    white-space: nowrap !important;
+    border-radius: 8px !important;
+    font-size: 13px !important;
+}
+
+/* Pulsante "x": rimuove la scheda solo dalla pagina, non dallo storico */
+div[class*="st-key-scheda_x_"] button {
+    padding: 0px !important;
+    min-height: 22px !important;
+    height: 22px !important;
+    width: 22px !important;
+    min-width: 22px !important;
+    border-radius: 50% !important;
+    font-size: 11px !important;
+    line-height: 1 !important;
+}
+
+/* In corso: bordo/sfondo ambra */
+div[class*="st-key-scheda_in_corso_"] button {
+    border-color: rgba(245,158,11,0.55) !important;
+    background: rgba(245,158,11,0.10) !important;
+}
+/* Errore: bordo/sfondo rosso */
+div[class*="st-key-scheda_errore_"] button {
+    border-color: rgba(220,50,50,0.5) !important;
+    background: rgba(220,50,50,0.08) !important;
+}
+/* Completata: bordo blu leggero */
+div[class*="st-key-scheda_completato_"] button {
+    border-color: rgba(37,99,235,0.35) !important;
+}
+
+/* Sidebar più stretta di default (resta comunque ridimensionabile a mano) */
+section[data-testid="stSidebar"] {
+    width: 250px !important;
+}
+section[data-testid="stSidebar"] > div:first-child {
+    width: 250px !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ──────────────────────────────────────────────────────────────────────────
+# CONFIGURAZIONE DI DOMINIO
+# ──────────────────────────────────────────────────────────────────────────
+@st.cache_resource
+def load_domain_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+DOMAIN_CONFIG = load_domain_config()
+EMPLOYEE_TAG = DOMAIN_CONFIG.get("actor_tags", {}).get("employee", "employee")
+RESTRICTED_CAMERAS = {
+    r["camera_id"] for r in DOMAIN_CONFIG.get("security_rules", {}).get("restricted_cameras", [])
+}
+
+
+def classifica_criticita(evento: dict) -> tuple[str, str]:
+    if not DOMAIN_CONFIG:
+        return "N/D", "Configurazione di dominio non disponibile"
+
+    dt_roma = converti_a_roma(evento.get("timestamp", ""))
+    if dt_roma is None:
+        return "N/D", "Timestamp non valido"
+
+    hour = dt_roma.hour
+    tags = evento.get("metadata", {}).get("tags", [])
+    is_employee = EMPLOYEE_TAG in tags
+    cam = evento.get("camera_id")
+
+    if cam in RESTRICTED_CAMERAS and not is_employee:
+        return "Critico", "Presenza non autorizzata nella camera blindata"
+
+    if 19 <= hour < 22:
+        if not is_employee:
+            return "Critico", "Soggetto non riconosciuto come dipendente fuori orario"
+        return "Basso", "Dipendente presente fuori orario"
+
+    if hour >= 22 or hour < 6:
+        if not is_employee:
+            return "Critico", "Presenza notturna non identificata come dipendente"
+        return "Medio", "Dipendente presente in orario notturno"
+
+    if 6 <= hour < 8:
+        if not is_employee:
+            return "Alto", "Soggetto non dipendente durante la pre-apertura"
+        return "Basso", "Dipendente in pre-apertura"
+
+    if "loitering" in tags:
+        return "Medio", "Stazionamento prolungato rilevato"
+    return "Basso", "Comportamento ordinario per orario e zona"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# HELPER GENERICI
+# ──────────────────────────────────────────────────────────────────────────
 def converti_a_roma(dt_str):
     try:
-        # Sostituisce la Z finale con +00:00 per renderla leggibile da fromisoformat
         dt_utc = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
         return dt_utc.astimezone(FUSO_ROMA)
     except Exception:
         return None
 
 
-# funzioni chiamata API
+def format_periodo(data_inizio, data_fine, ora_inizio, ora_fine):
+    st.markdown(f"**Intervallo date:** {data_inizio} → {data_fine}")
+    st.markdown(f"**Intervallo orario:** {ora_inizio} → {ora_fine}")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CHIAMATE API
+# ──────────────────────────────────────────────────────────────────────────
 def get_cameras():
     try:
         r = requests.get(f"{API_BASE_URL}/cameras", timeout=10)
@@ -59,16 +250,6 @@ def get_events(params):
     return None
 
 
-def get_stats(params):
-    try:
-        r = requests.get(f"{API_BASE_URL}/stats", params=params, timeout=30)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        st.error(f"Errore statistiche: {e}")
-    return None
-
-
 def generate_summary(payload):
     try:
         r = requests.post(f"{API_BASE_URL}/summaries", json=payload, timeout=None)
@@ -79,6 +260,45 @@ def generate_summary(payload):
     except Exception as e:
         st.error(f"Errore connessione LLM: {e}")
     return None
+
+
+def richiedi_analisi_async(payload):
+    """Crea subito la 'scheda' di analisi: il backend risponde all'istante con
+    un id e lancia la generazione LLM in background."""
+    try:
+        r = requests.post(f"{API_BASE_URL}/summaries/richiedi", json=payload, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError as e:
+        st.error(f"Errore nella richiesta di analisi: {e.response.text}")
+    except Exception as e:
+        st.error(f"Errore connessione: {e}")
+    return None
+
+
+def get_scheda_analisi(scheda_id: str, tipo: str):
+    """Interroga lo stato/risultato di una scheda di analisi (in_corso / completato / errore)."""
+    try:
+        r = requests.get(f"{API_BASE_URL}/summaries/{scheda_id}", params={"tipo": tipo}, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError as e:
+        st.error(f"Errore nel recupero della scheda: {e.response.text}")
+    except Exception as e:
+        st.error(f"Errore connessione: {e}")
+    return None
+
+
+def nascondi_scheda_analisi(scheda_id: str, tipo: str):
+    """Nasconde la scheda dalla Dashboard in modo permanente (persistito lato
+    server): il record resta comunque nello Storico risposte."""
+    try:
+        r = requests.post(f"{API_BASE_URL}/summaries/{scheda_id}/nascondi", params={"tipo": tipo}, timeout=15)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        st.error(f"Errore durante la rimozione della scheda: {e}")
+        return False
 
 
 def create_automation_job(payload):
@@ -110,10 +330,8 @@ def pause_automation_job(job_id):
         r = requests.post(f"{API_BASE_URL}/automation_jobs/{job_id}/pause", timeout=15)
         r.raise_for_status()
         return r.json()
-    except requests.HTTPError as e:
-        st.error(f"Errore durante la pausa del job: {e.response.text}")
     except Exception as e:
-        st.error(f"Errore connessione: {e}")
+        st.error(f"Errore durante la pausa del job: {e}")
     return None
 
 
@@ -122,662 +340,683 @@ def resume_automation_job(job_id):
         r = requests.post(f"{API_BASE_URL}/automation_jobs/{job_id}/resume", timeout=15)
         r.raise_for_status()
         return r.json()
-    except requests.HTTPError as e:
-        st.error(f"Errore durante la ripresa del job: {e.response.text}")
     except Exception as e:
-        st.error(f"Errore connessione: {e}")
+        st.error(f"Errore durante la ripresa del job: {e}")
     return None
 
 
-def format_periodo(data_inizio, data_fine, ora_inizio, ora_fine):
-    # Mostra l'intervallo temporale esattamente così come inserito o salvato, senza applicare conversioni di fuso.
-    st.markdown(f"**Intervallo date:** {data_inizio} → {data_fine}")
-    st.markdown(f"**Intervallo orario:** {ora_inizio} → {ora_fine}")
-
-
-def get_event_by_id(event_id):
+def get_history(kind: str):
+    endpoint = "analysis_history" if kind == "analysis" else "prompt_history"
     try:
-        r = requests.get(f"{API_BASE_URL}/events/{event_id}", timeout=15)
+        r = requests.get(f"{API_BASE_URL}/{endpoint}", timeout=20)
         r.raise_for_status()
         return r.json()
-    except Exception:
+    except Exception as e:
+        st.error(f"Errore recupero storico: {e}")
         return None
 
 
-# Inizializza lo stato delle telecamere nel session_state se non esiste già
+def delete_history_item(kind: str, item_id: str):
+    endpoint = "analysis_history" if kind == "analysis" else "prompt_history"
+    try:
+        r = requests.delete(f"{API_BASE_URL}/{endpoint}/{item_id}", timeout=15)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# SESSION STATE
+# ──────────────────────────────────────────────────────────────────────────
+if "page" not in st.session_state:
+    st.session_state.page = "Dashboard"
+
 if "camera_status" not in st.session_state:
     cameras_list = get_cameras()
-    # all'inizio tutte le telecamere sono attive
     st.session_state.camera_status = {c["camera_id"]: True for c in cameras_list}
 
-if "loaded_events" not in st.session_state:
-    st.session_state.loaded_events = None
-if "loaded_stats" not in st.session_state:
-    st.session_state.loaded_stats = None
+if "table_page" not in st.session_state:
+    st.session_state.table_page = 1
 if "excluded_events" not in st.session_state:
     st.session_state.excluded_events = set()
+if "sort_column" not in st.session_state:
+    st.session_state.sort_column = "Data e ora"
+if "sort_ascending" not in st.session_state:
+    st.session_state.sort_ascending = False
+if "scheda_attiva" not in st.session_state:
+    # (id, tipo) della scheda di analisi attualmente aperta; None = vista eventi
+    st.session_state.scheda_attiva = None
 
-# INTERFACCIA: titolo e pulsanti delle telecamere
-st.title("Sistema di Sorveglianza Intelligente")
-st.subheader("Stato telecamere")
-st.write("Clicca su una telecamera per escluderla/includerla dalla ricerca:")
-
-cameras_data = get_cameras()
-if cameras_data:
-    cols = st.columns(len(cameras_data))
-
-    for idx, c in enumerate(cameras_data):
-        cam_id = c["camera_id"]
-        cam_loc = c["location"]
-        is_active = st.session_state.camera_status.get(cam_id, True)
-        label = f"{cam_loc}" if is_active else f" {cam_loc}\n(DISATTIVATA)"
-        btn_type = "primary" if is_active else "secondary"
-
-        if cols[idx].button(label, key=f"btn_{cam_id}", type=btn_type, use_container_width=True):
-            # cliccare inverte lo stato
-            st.session_state.camera_status[cam_id] = not is_active
-            st.rerun()
-
+# ──────────────────────────────────────────────────────────────────────────
 # SIDEBAR
-st.sidebar.header(" Filtri")
+# ──────────────────────────────────────────────────────────────────────────
+st.sidebar.markdown("## Sistema di sorveglianza intelligente")
+st.sidebar.caption("Monitoraggio e analisi degli eventi")
+st.sidebar.divider()
 
-today = date.today()
-start_date = st.sidebar.date_input("Data iniziale", value=today)
-end_date = st.sidebar.date_input("Data finale", value=today)
+nav_items = ["Dashboard", "Impostazioni", "Storico risposte"]
+for item in nav_items:
+    tipo = "primary" if st.session_state.page == item else "secondary"
+    if st.sidebar.button(item, key=f"nav_{item}", use_container_width=True, type=tipo):
+        st.session_state.page = item
+        st.rerun()
 
-# default alle 00:01 del giorno corrente
-start_time = st.sidebar.time_input("Ora iniziale", value=time(0, 1))
-end_time = st.sidebar.time_input("Ora finale", value=time(23, 59))
+st.sidebar.divider()
 
-start_dt = datetime.combine(start_date, start_time)
-end_dt = datetime.combine(end_date, end_time)
+if st.session_state.page == "Dashboard":
+    st.sidebar.markdown("### Filtri globali")
+    st.sidebar.caption("I filtri si aggiornano automaticamente ad ogni modifica.")
 
-event_type = st.sidebar.selectbox(
-    "Tipo evento",
-    ["tutti", "movement", "idle", "crowd"],
-)
+    today = date.today()
+    start_date = st.sidebar.date_input("Data iniziale", value=today - timedelta(days=1))
+    end_date = st.sidebar.date_input("Data finale", value=today)
 
-opzioni_limite = {
-    "Tutti (Nessun limite)": 0,
-    "10 eventi": 10,
-    "25 eventi": 25,
-    "50 eventi": 50,
-    "100 eventi": 100,
-    "250 eventi": 250,
-    "500 eventi": 500,
-    "1000 eventi": 1000
-}
+    start_time = st.sidebar.time_input("Ora iniziale", value=time(0, 1))
+    end_time = st.sidebar.time_input("Ora finale", value=time(23, 59))
 
-limite_selezionato = st.sidebar.selectbox(
-    "Numero massimo eventi",
-    options=list(opzioni_limite.keys()),
-    index=3  # Imposta di default "100 eventi"
-)
-limit = opzioni_limite[limite_selezionato]
+    start_dt = datetime.combine(start_date, start_time)
+    end_dt = datetime.combine(end_date, end_time)
 
-load_button = st.sidebar.button("Carica eventi")
+    tipi_evento_sel = st.sidebar.multiselect(
+        "Tipo evento",
+        ["movement", "idle", "crowd"],
+        default=[],
+        placeholder="Tutti i tipi",
+    )
 
-# Prende la lista di tutte le camere che sono attive
-camere_attive = [cam_id for cam_id, active in st.session_state.camera_status.items() if active]
+    ricerca_libera = st.sidebar.text_input(
+        "Ricerca libera",
+        placeholder="Cerca in descrizione, posizione, camera...",
+    )
 
-params = {
-    "start": start_dt.isoformat(),
-    "end": end_dt.isoformat(),
-    "limit": limit,
-}
+    limit = 0
 
-if event_type != "tutti":
-    params["event_type"] = event_type
+    if st.sidebar.button("Reimposta filtri", use_container_width=True):
+        st.session_state.table_page = 1
+        st.session_state.excluded_events = set()
+        st.session_state.sort_column = "Data e ora"
+        st.session_state.sort_ascending = False
+        st.rerun()
+else:
+    start_dt = datetime.combine(date.today() - timedelta(days=1), time(0, 1))
+    end_dt = datetime.combine(date.today(), time(23, 59))
+    tipi_evento_sel, ricerca_libera, limit = [], "", 0
 
-if camere_attive:
-    params["camera_ids"] = camere_attive
+st.sidebar.divider()
+st.sidebar.caption(f"Backend: `{API_BASE_URL}`")
 
-if load_button:
-    with st.spinner("Recupero eventi dal backend..."):
+
+ICONA_STATO = {"in_corso": "⏳", "errore": "⚠️", "completato": "✅"}
+ETICHETTA_STATO = {"in_corso": "In corso", "errore": "Errore", "completato": "Pronta"}
+
+def render_schede_analisi(storico_analisi, storico_prompt):
+    """Mostra le richieste di analisi AI come schede."""
+
+    schede = [{**it, "tipo": "standard"} for it in storico_analisi]
+    schede += [{**it, "tipo": "prompt"} for it in storico_prompt]
+
+    if not schede:
+        return
+
+    def _ts(it):
+        return converti_a_roma(it.get("request_date", "")) or datetime.min.replace(
+            tzinfo=FUSO_ROMA
+        )
+
+    schede.sort(key=_ts, reverse=True)
+    schede = [s for s in schede if not s.get("nascosta")]
+
+    if not schede:
+        return
+
+    st.markdown("")
+    st.markdown("##### 🗂️ Le tue analisi")
+
+    # Riga di colonne
+    cols = st.columns(len(schede), gap="small")
+
+    for col, it in zip(cols, schede):
+
+        scheda_id = it["_id"]
+        tipo = it["tipo"]
+        stato = it.get(
+            "stato",
+            "completato" if it.get("risposta") else "in_corso"
+        )
+
+        testo_data = _ts(it).strftime("%d/%m/%Y %H:%M")
+
+        with col:
+
+            if st.button(
+                f"{ICONA_STATO.get(stato,'✅')} {testo_data}",
+                key=f"scheda_{stato}_{scheda_id}",
+                use_container_width=True,
+            ):
+                st.session_state.scheda_attiva = (scheda_id, tipo)
+                st.rerun()
+
+            if st.button(
+                "✕",
+                key=f"scheda_x_{scheda_id}",
+                use_container_width=True,
+                help="Rimuovi dalla pagina (resta nello storico)",
+            ):
+                if nascondi_scheda_analisi(scheda_id, tipo):
+                    st.rerun()
+def render_vista_risposta_analisi():
+    """Vista a schermo intero per una scheda: se l'analisi è ancora in corso
+    mostra uno spinner e ricontrolla periodicamente, altrimenti la risposta."""
+    scheda_id, tipo = st.session_state.scheda_attiva
+
+    if st.button("← Torna agli eventi"):
+        st.session_state.scheda_attiva = None
+        st.rerun()
+
+    scheda = get_scheda_analisi(scheda_id, tipo)
+    if not scheda:
+        st.warning("Impossibile recuperare questa scheda di analisi.")
+        return
+
+    stato = scheda.get("stato", "completato" if scheda.get("risposta") else "in_corso")
+    dt_roma = converti_a_roma(scheda.get("request_date", ""))
+    testo_data = dt_roma.strftime("%d/%m/%Y %H:%M:%S") if dt_roma else "-"
+
+    st.markdown(f"#### Risultato analisi AI — {testo_data}")
+    dettagli = f"{scheda.get('numero_eventi', '?')} eventi analizzati"
+    if scheda.get("LLM"):
+        dettagli += f" · {scheda['LLM']}"
+    st.caption(dettagli)
+    if scheda.get("prompt"):
+        st.caption(f"Richiesta personalizzata: _{scheda['prompt']}_")
+
+    if stato == "in_corso":
+        with st.spinner("🤖 L'AI sta ultimando la tua richiesta..."):
+            pytime.sleep(3)
+        st.rerun()
+    elif stato == "errore":
+        st.error(f"Si è verificato un errore durante l'analisi: {scheda.get('errore', 'errore sconosciuto')}")
+    else:
+        st.success("Elaborazione completata!")
+        st.markdown(scheda.get("risposta") or "_Nessuna risposta disponibile._")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PAGINA: DASHBOARD (HOME)
+# ──────────────────────────────────────────────────────────────────────────
+def pagina_dashboard():
+    st.title("Dashboard")
+    st.caption("Monitoraggio e analisi degli eventi")
+
+    camere_attive = [cam_id for cam_id, active in st.session_state.camera_status.items() if active]
+    cameras_data = get_cameras()
+
+    params = {"start": start_dt.isoformat(), "end": end_dt.isoformat(), "limit": limit}
+    if len(tipi_evento_sel) == 1:
+        params["event_type"] = tipi_evento_sel[0]
+
+    with st.spinner("Caricamento eventi..."):
         data = get_events(params)
-        if data is not None:
-            st.session_state.loaded_events = data["events"]
-            st.session_state.excluded_events = set()
+        eventi_periodo = data["events"] if data else []
 
-            stats_params = {
-                "start": start_dt.isoformat(),
-                "end": end_dt.isoformat(),
-            }
-            if camere_attive:
-                stats_params["camera_ids"] = camere_attive
-            st.session_state.loaded_stats = get_stats(stats_params)
+    if len(tipi_evento_sel) > 1:
+        eventi_periodo = [e for e in eventi_periodo if e["event_type"] in tipi_evento_sel]
 
-tab_dashboard, tab_intelligenza_art, tab_responses, tab_scheduler = st.tabs(
-    ["Monitoraggio Eventi ", " Analisi e Sintesi AI", " Visualizza risposte passate",
-     " Visualizza risposte da scheduler periodici"])
+    now = datetime.now()
+    params_24h = {"start": (now - timedelta(hours=24)).isoformat(), "end": now.isoformat(), "limit": 0}
+    dati_24h = get_events(params_24h)
 
-# Tab 1: Visualizzazione dati
-with tab_dashboard:
-    if st.session_state.loaded_events is not None:
-        events = st.session_state.loaded_events
+    eventi_24h = dati_24h["events"] if dati_24h else []
+    classificati_24h = [(e, *classifica_criticita(e)) for e in eventi_24h]
+    critici_24h = [e for e, liv, _ in classificati_24h if liv == "Critico"]
 
-        if events:
-            rows = []
-            for e in events:
-                rows.append({
-                    "_id": e["_id"],
-                    "timestamp": e["timestamp"],
-                    "camera": e["camera_id"],
-                    "location": e["location"],
-                    "event_type": e["event_type"],
-                    "description": e["description"],
-                    "confidence": e.get("metadata", {}).get("confidence"),
-                })
-            df = pd.DataFrame(rows)
+    storico_analisi = get_history("analysis") or []
+    storico_prompt = get_history("prompt") or []
+    analisi_24h = [
+        it for it in (storico_analisi + storico_prompt)
+        if converti_a_roma(it.get("request_date", "")) and
+           converti_a_roma(it["request_date"]) >= datetime.now(FUSO_ROMA) - timedelta(hours=24)
+    ]
 
-            stats = st.session_state.loaded_stats
-            if stats:
-                col1, _ = st.columns(2)
-                with col1:
-                    st.metric("Totale eventi recuperati", stats["total_events"])
+    n_camere_attive = sum(1 for v in st.session_state.camera_status.values() if v)
+    n_camere_totali = len(st.session_state.camera_status) or 1
 
-            n_esclusi = len(st.session_state.excluded_events)
-            st.subheader("Lista eventi")
-            st.caption(
-                f"Clicca su un evento per escluderlo dall'analisi LLM. "
-                f"Eventi esclusi: **{n_esclusi}** / {len(events)}"
-            )
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric("📅 Eventi ultime 24 ore", len(eventi_24h))
+    with k2:
+        st.metric("⚠️ Eventi critici", len(critici_24h))
+    with k3:
+        st.metric("🎥 Telecamere attive", f"{n_camere_attive} / {n_camere_totali}")
+    with k4:
+        st.metric("🧠 Analisi AI completate", len(analisi_24h))
 
-            if n_esclusi > 0:
-                if st.button("Ripristina tutti gli eventi"):
-                    st.session_state.excluded_events = set()
+    st.markdown("")
+    with st.container():
+        st.markdown('<div class="critical-box">', unsafe_allow_html=True)
+        st.markdown("#### 🔴 Eventi critici · ultime 24 ore")
+        if not critici_24h:
+            st.caption("Nessun evento critico rilevato nelle ultime 24 ore.")
+        else:
+            for e in critici_24h[:5]:
+                _, liv, motivo = next(c for c in classificati_24h if c[0] is e)
+                dt_roma = converti_a_roma(e["timestamp"])
+                testo_data = dt_roma.strftime("%d/%m %H:%M") if dt_roma else e["timestamp"]
+                c1, c2, c3 = st.columns([2, 5, 2])
+                c1.markdown(f"**{testo_data}**")
+                c2.markdown(f"**{e['description']}** — {e['location']}  \n_{motivo}_")
+                c3.markdown(f"{BADGE.get(liv, liv)}")
+                st.divider()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("")
+    st.markdown(f"#### Telecamere ")
+
+    if cameras_data:
+        cols = st.columns(min(len(cameras_data), 6))
+        for idx, c in enumerate(cameras_data):
+            cam_id = c["camera_id"]
+            cam_loc = c["location"]
+            is_active = st.session_state.camera_status.get(cam_id, True)
+            with cols[idx % len(cols)]:
+                label = f"{cam_loc}  \n{'Attiva' if is_active else 'Offline'}"
+                btn_type = "primary" if is_active else "secondary"
+                if st.button(label, key=f"btn_{cam_id}", use_container_width=True, type=btn_type):
+                    st.session_state.camera_status[cam_id] = not is_active
                     st.rerun()
 
-            header = st.columns([2, 1.5, 2, 1.2, 3, 1, 1.2])
-            headers_text = ["Timestamp", "Camera", "Location", "Tipo", "Descrizione", "Confidence", "Azione"]
-            for col, label in zip(header, headers_text):
-                col.markdown(f"**{label}**")
-            st.divider()
+    eventi_filtrati = [e for e in eventi_periodo if e["camera_id"] in camere_attive]
 
-            for _, row in df.iterrows():
-                event_id = row["_id"]
-                escluso = event_id in st.session_state.excluded_events
+    if ricerca_libera.strip():
+        chiave = ricerca_libera.strip().lower()
+        eventi_filtrati = [
+            e for e in eventi_filtrati
+            if chiave in e["description"].lower()
+               or chiave in e["location"].lower()
+               or chiave in e["camera_id"].lower()
+               or chiave in e["event_type"].lower()
+        ]
 
-                cols = st.columns([2, 1.5, 2, 1.2, 3, 1, 1.2])
+    eventi_inclusi_analisi = [e for e in eventi_filtrati if e["_id"] not in st.session_state.excluded_events]
+    n_esclusi = len(st.session_state.excluded_events)
 
+    render_schede_analisi(storico_analisi, storico_prompt)
 
-                # se l'evento è escluso viene sbarrato
-                def cell(col, testo, escluso):
-                    if escluso:
-                        col.markdown(f"<span style='color:#cc3333; text-decoration:line-through;'>**{testo}**</span>",
-                                     unsafe_allow_html=True)
+    if st.session_state.scheda_attiva:
+        render_vista_risposta_analisi()
+        return
+
+    st.markdown("")
+    with st.form("form_analisi_ai", clear_on_submit=False):
+        col_prompt, col_submit = st.columns([5, 1.4])
+        with col_prompt:
+            ai_prompt_input = st.text_input(
+                "Analizza con AI",
+                placeholder="✨ Analizza con AI oppure scrivi qui una tua richiesta",
+                label_visibility="collapsed",
+            )
+        with col_submit:
+            analisi_avviata = st.form_submit_button("Analizza con AI", use_container_width=True)
+
+    ai_prompt = ai_prompt_input.strip() if ai_prompt_input and ai_prompt_input.strip() else None
+
+    if n_esclusi > 0:
+        st.caption(f"L'analisi verrà eseguita su **{len(eventi_inclusi_analisi)}** eventi ({n_esclusi} esclusi).")
+
+    if analisi_avviata:
+        if not eventi_inclusi_analisi:
+            st.warning("Nessun evento disponibile per l'analisi.")
+        else:
+            payload = {
+                "start": start_dt.isoformat(),
+                "end": end_dt.isoformat(),
+                "custom_prompt": ai_prompt if ai_prompt else None,
+                "selected_events": eventi_inclusi_analisi,
+                "camera_ids": camere_attive,
+            }
+            # la richiesta torna subito con l'id della scheda: l'LLM lavora
+            # in background sul server, l'utente non resta bloccato in attesa
+            esito = richiedi_analisi_async(payload)
+            if esito:
+                st.session_state.scheda_attiva = (esito["id"], esito["tipo"])
+                st.rerun()
+
+    st.markdown("")
+    st.markdown("#### Tutti gli eventi")
+
+    col_head, col_refresh, col_export = st.columns([4, 1, 1])
+    with col_head:
+        st.caption(f"{len(eventi_filtrati)} risultati per i filtri correnti")
+    with col_refresh:
+        if st.button("🔄 Aggiorna", use_container_width=True):
+            st.rerun()
+
+    if not eventi_filtrati:
+        st.info("Nessun evento trovato per i filtri correnti.")
+        return
+
+    rows = []
+    for e in eventi_filtrati:
+        dt_roma = converti_a_roma(e["timestamp"])
+        rows.append({
+            "_id": e["_id"],
+            "Data e ora": dt_roma if dt_roma else e["timestamp"],
+            "Telecamera": e["camera_id"],
+            "Posizione": e["location"],
+            "Tipo": e["event_type"],
+            "Descrizione": e["description"],
+            "Confidenza": e.get("metadata", {}).get("confidence"),
+        })
+    df_full = pd.DataFrame(rows)
+
+    with col_export:
+        st.download_button(
+            "Esporta CSV",
+            data=df_full.drop(columns=["_id"]).to_csv(index=False).encode("utf-8"),
+            file_name="eventi_filtrati.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    col_pp_label, col_pp = st.columns([3, 1])
+    per_pagina = col_pp.selectbox("Per pagina", [10, 25, 50, 100], index=0, label_visibility="collapsed")
+
+    df_sorted = df_full.sort_values(
+        by=st.session_state.sort_column,
+        ascending=st.session_state.sort_ascending,
+        na_position="last"
+    )
+
+    n_eventi = len(df_sorted)
+    n_pagine = max(1, -(-n_eventi // per_pagina))
+    st.session_state.table_page = min(st.session_state.table_page, n_pagine)
+
+    start_idx = (st.session_state.table_page - 1) * per_pagina
+    end_idx = start_idx + per_pagina
+    df_page = df_sorted.iloc[start_idx:end_idx].reset_index(drop=True)
+
+    # ── Intestazione tabella Responsive ──
+    # Tutti i campi dati sono ordinabili; "Azione" resta escluso perché non è un dato
+    # ma la colonna dei pulsanti Escludi/Includi.
+    COLONNE_ORDINABILI = {"Data e ora", "Telecamera", "Posizione", "Tipo", "Descrizione", "Confidenza"}
+
+    # Proporzioni ricalibrate per garantire respiro a ogni colonna
+    header_widths = [2.2, 1.8, 2.2, 1.5, 3.8, 1.5, 1.2]
+    header_labels = ["Data e ora", "Telecamera", "Posizione", "Tipo", "Descrizione", "Confidenza", "Azione"]
+
+    tabella_container = st.container(key="events_table")
+    with tabella_container:
+        header_container = st.container(key="table_header")
+        with header_container:
+            header_cols = st.columns(header_widths)
+
+            for col, label in zip(header_cols, header_labels):
+                with col:
+                    if label in COLONNE_ORDINABILI:
+                        is_curr_col = (st.session_state.sort_column == label)
+                        up_active = is_curr_col and st.session_state.sort_ascending
+                        down_active = is_curr_col and not st.session_state.sort_ascending
+
+                        # Nome colonna + due freccette compatte impilate (▲ crescente / ▼ decrescente)
+                        c_head1, c_head2 = st.columns([0.8, 0.2])
+                        with c_head1:
+                            st.markdown(f'<span class="col-label">{label}</span>', unsafe_allow_html=True)
+                        with c_head2:
+                            if st.button("▲", key=f"sort_up_{label}",
+                                         type="primary" if up_active else "secondary",
+                                         help=f"Ordina per {label} (crescente)"):
+                                st.session_state.sort_column = label
+                                st.session_state.sort_ascending = True
+                                st.session_state.table_page = 1
+                                st.rerun()
+                            if st.button("▼", key=f"sort_down_{label}",
+                                         type="primary" if down_active else "secondary",
+                                         help=f"Ordina per {label} (decrescente)"):
+                                st.session_state.sort_column = label
+                                st.session_state.sort_ascending = False
+                                st.session_state.table_page = 1
+                                st.rerun()
                     else:
-                        col.markdown(str(testo))
+                        st.markdown(f'<span class="col-label">{label}</span>', unsafe_allow_html=True)
 
+        st.divider()
 
-                # Conversione del timestamp dell'evento reale (UTC da DB) al fuso orario di Roma prima del rendering
-                dt_roma = converti_a_roma(row["timestamp"])
-                if dt_roma:
-                    testo_data = dt_roma.strftime("%H:%M  %d/%m/%Y")
+        # Righe dati
+        for _, row in df_page.iterrows():
+            event_id = row["_id"]
+            escluso = event_id in st.session_state.excluded_events
+
+            cols = st.columns(header_widths)
+
+            def cell(col, testo, escluso=escluso):
+                if escluso:
+                    col.markdown(f"<span style='color:#cc3333; text-decoration:line-through;'>{testo}</span>",
+                                 unsafe_allow_html=True)
                 else:
-                    testo_data = row["timestamp"][11:16] + " " + row["timestamp"][:10]
+                    col.markdown(str(testo))
 
-                cell(cols[0], testo_data, escluso)
-                cell(cols[1], row["camera"], escluso)
-                cell(cols[2], row["location"], escluso)
-                cell(cols[3], row["event_type"], escluso)
-                cell(cols[4], row["description"], escluso)
-                cell(cols[5], row["confidence"], escluso)
+            data_val = row["Data e ora"]
+            testo_data = data_val.strftime("%d/%m/%Y %H:%M:%S") if isinstance(data_val, datetime) else str(data_val)
 
-                label_btn = "✓ includi" if escluso else "✕ escludi"
-                if cols[6].button(label_btn, key=f"exc_{event_id}", use_container_width=True):
+            cell(cols[0], testo_data)
+            cell(cols[1], row["Telecamera"])
+            cell(cols[2], row["Posizione"])
+            cell(cols[3], row["Tipo"])
+            cell(cols[4], row["Descrizione"])
+            cell(cols[5], row["Confidenza"])
+
+            label_btn = "✓ Includi" if escluso else "✕ Escludi"
+            with cols[6]:
+                st.markdown('<div class="btn-action">', unsafe_allow_html=True)
+                if st.button(label_btn, key=f"exc_{event_id}", use_container_width=True):
                     if escluso:
                         st.session_state.excluded_events.discard(event_id)
                     else:
                         st.session_state.excluded_events.add(event_id)
                     st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
 
-                st.divider()
-        else:
-            st.warning("Nessun evento trovato per i criteri o per le telecamere selezionate.")
-    else:
-        st.info("Imposta i filtri nella barra laterale a sinistra e clicca su 'Carica eventi'.")
+            st.divider()
 
-# Tab 2: Logica generativa (Ollama)
-with tab_intelligenza_art:
-    st.subheader("Analisi degli eventi con LLM locale")
-    st.write("Fai una richiesta personalizzata oppure clicca il tasto per una sintesi.")
-
-    tasto_standard = st.button("Avvia Elaborazione Sintesi Standard")
-    user_custom_prompt = st.chat_input("Scrivi qui cosa vuoi chiedere a Ollama riguardo agli eventi...")
-
-    st.divider()
-    st.markdown("**Modalità automatica (job periodico)**")
-    col_switch, col_freq = st.columns([1, 2])
-    with col_switch:
-        label_toggle = "Disattiva" if st.session_state.get("auto_job_toggle", False) else "Attiva"
-        modalita_automatica_on = st.toggle(label_toggle, key="auto_job_toggle")
-    with col_freq:
-        interval_minutes = st.number_input(
-            "Frequenza (minuti)",
-            min_value=1,
-            step=1,
-            value=None,
-            placeholder="Es. 30",
-            disabled=not modalita_automatica_on,
-            key="auto_job_interval",
+    # Paginazione
+    col_prev, col_info, col_next = st.columns([1, 3, 1])
+    with col_prev:
+        if st.button("← Precedente", disabled=st.session_state.table_page <= 1, use_container_width=True):
+            st.session_state.table_page -= 1
+            st.rerun()
+    with col_info:
+        st.markdown(
+            f"<div style='text-align:center'>Pagina {st.session_state.table_page} di {n_pagine} "
+            f"— eventi {start_idx + 1}-{min(end_idx, n_eventi)} di {n_eventi}</div>",
+            unsafe_allow_html=True,
         )
+    with col_next:
+        if st.button("Successiva →", disabled=st.session_state.table_page >= n_pagine, use_container_width=True):
+            st.session_state.table_page += 1
+            st.rerun()
 
-    titolo_job = st.text_input(
-        "Titolo job (opzionale)",
-        value="",
-        placeholder="Es. Monitoraggio ingresso notturno",
-        disabled=not modalita_automatica_on,
-        key="auto_job_titolo",
-    )
 
-    modalita_automatica = bool(modalita_automatica_on) and bool(interval_minutes)
+# ──────────────────────────────────────────────────────────────────────────
+# PAGINA: IMPOSTAZIONI
+# ──────────────────────────────────────────────────────────────────────────
+def pagina_impostazioni():
+    st.title("Impostazioni")
+    st.caption("Configura ed esegui l'analisi automatica periodica degli eventi")
 
-    if tasto_standard or user_custom_prompt:
+    cameras_data = get_cameras()
+    camera_options = [c["camera_id"] for c in cameras_data] if cameras_data else []
 
-        if modalita_automatica:
-            tipi_evento_job = [] if event_type == "tutti" else [event_type]
-            esclusi = st.session_state.get("excluded_events", set())
+    with st.expander("➕ Crea nuovo job di analisi automatica", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            job_camere = st.multiselect("Telecamere incluse (vuoto = tutte)", camera_options)
+            job_tipi = st.multiselect("Tipi evento inclusi (vuoto = tutti)", ["movement", "idle", "crowd"])
+            job_titolo = st.text_input("Titolo job (opzionale)", placeholder="Es. Monitoraggio ingresso notturno")
+        with col2:
+            job_start_date = st.date_input("Data inizio periodo", value=date.today(), key="job_start_date")
+            job_start_time = st.time_input("Ora inizio periodo", value=time(0, 0), key="job_start_time")
+            job_end_date = st.date_input("Data fine periodo", value=date.today(), key="job_end_date")
+            job_end_time = st.time_input("Ora fine periodo", value=time(23, 59), key="job_end_time")
 
-            job_payload = {
-                "camera_ids": camere_attive,
-                "tipi_evento": tipi_evento_job,
-                "custom_prompt": user_custom_prompt if user_custom_prompt else None,
-                "titolo": titolo_job.strip() if titolo_job and titolo_job.strip() else None,
-                "max_events": limit,
-                "interval_minutes": int(interval_minutes),
-                "excluded_ids": list(esclusi),
-                "start": start_dt.isoformat(),
-                "end": end_dt.isoformat(),
+        st.markdown("**Frequenza di esecuzione**")
+        col_20, col_40, col_60, col_custom = st.columns(4)
+        if "job_interval" not in st.session_state:
+            st.session_state.job_interval = 30
+        if col_20.button("Ogni 20 min", use_container_width=True):
+            st.session_state.job_interval = 20
+        if col_40.button("Ogni 40 min", use_container_width=True):
+            st.session_state.job_interval = 40
+        if col_60.button("Ogni 60 min", use_container_width=True):
+            st.session_state.job_interval = 60
+        with col_custom:
+            custom_interval = st.number_input(
+                "Personalizzata (min)", min_value=1, step=1,
+                value=st.session_state.job_interval, label_visibility="collapsed",
+            )
+            st.session_state.job_interval = int(custom_interval)
+
+        st.caption(f"Frequenza selezionata: ogni **{st.session_state.job_interval}** minuti")
+
+        job_prompt = st.text_area(
+            "Prompt personalizzato (lascia vuoto per la sintesi standard)",
+            placeholder="Es. Segnala solo eventi relativi alla camera blindata",
+        )
+        job_max_events = 0
+
+        if st.button("Crea job periodico", type="primary"):
+            job_start_dt = datetime.combine(job_start_date, job_start_time)
+            job_end_dt = datetime.combine(job_end_date, job_end_time)
+            payload = {
+                "camera_ids": job_camere,
+                "tipi_evento": job_tipi,
+                "custom_prompt": job_prompt if job_prompt else None,
+                "titolo": job_titolo.strip() if job_titolo.strip() else None,
+                "max_events": job_max_events,
+                "interval_minutes": st.session_state.job_interval,
+                "excluded_ids": [],
+                "start": job_start_dt.isoformat(),
+                "end": job_end_dt.isoformat(),
             }
-
-            with st.spinner("Creazione job periodico in corso..."):
-                job_result = create_automation_job(job_payload)
-
-            if job_result:
-                st.success(
-                    f"Job periodico creato: verrà eseguito ogni {int(interval_minutes)} minuti. "
-                    f"Consulta i risultati nella tab 'Visualizza risposte da scheduler periodici'."
-                )
-        else:
-            eventi_caricati = st.session_state.get("loaded_events", [])
-            esclusi = st.session_state.get("excluded_events", set())
-
-            # Filtra via gli eventi che l'utente ha escluso
-            eventi_inclusi = [e for e in eventi_caricati if e["_id"] not in esclusi]
-
-            if not eventi_caricati:
-                st.warning("Carica prima gli eventi dal tab 'Monitoraggio Eventi' utilizzando i filtri laterali.")
-            elif not eventi_inclusi:
-                st.warning(
-                    "Tutti gli eventi caricati sono stati esclusi. Ripristina almeno un evento prima di avviare l'analisi.")
-            else:
-                n_esclusi = len(esclusi)
-                if n_esclusi > 0:
-                    st.info(
-                        f"L'analisi verrà eseguita su **{len(eventi_inclusi)}** eventi ({n_esclusi} esclusi manualmente e non inviati al modello).")
-
-                payload = {
-                    "start": start_dt.isoformat(),
-                    "end": end_dt.isoformat(),
-                    "custom_prompt": user_custom_prompt if user_custom_prompt else None,
-                    "selected_events": eventi_inclusi,
-                }
-                if camere_attive:
-                    payload["camera_ids"] = camere_attive
-
-                msg_caricamento = (
-                    "Ollama sta generando la sintesi standard..."
-                    if not user_custom_prompt
-                    else f"Ollama sta elaborando: '{user_custom_prompt}'..."
-                )
-
-                with st.spinner(msg_caricamento):
-                    summary_data = generate_summary(payload)
-
-                    if summary_data:
-                        st.success("Elaborazione completata!")
-                        st.subheader("Analisi di Ollama")
-                        st.markdown(summary_data["summary"])
-
-    # Tab 3 log delle risposte passate
-    with tab_responses:
-
-        st.subheader("Log delle risposte")
-
-        if "history_view" not in st.session_state:
-            st.session_state.history_view = None
-
-        left, center, right = st.columns([1, 2, 1])
-
-        with center:
-            c1, c2 = st.columns(2)
-
-        with c1:
-            btn_type_analysis = "primary" if st.session_state.history_view == "analysis" else "secondary"
-            if st.button("Sintesi passate", use_container_width=True, type=btn_type_analysis):
-                st.session_state.history_view = "analysis"
+            with st.spinner("Creazione job in corso..."):
+                result = create_automation_job(payload)
+            if result:
+                st.success("Job creato correttamente.")
                 st.rerun()
 
-        with c2:
-            btn_type_prompt = "primary" if st.session_state.history_view == "prompt" else "secondary"
-            if st.button("Risposte ai prompt", use_container_width=True, type=btn_type_prompt):
-                st.session_state.history_view = "prompt"
-                st.rerun()
+    st.divider()
+    st.markdown("### Job configurati")
 
-        st.divider()
+    jobs = get_automation_jobs()
+    if jobs is None:
+        return
+    if not jobs:
+        st.info("Non sono presenti job periodici configurati.")
+        return
 
-        if st.session_state.history_view == "analysis":
+    for job in jobs:
+        job_id = job["_id"]
 
-            response = requests.get(f"{API_BASE_URL}/analysis_history")
+        ultima_modifica_raw = job.get("ultima_modifica")
+        dt_mod = converti_a_roma(str(ultima_modifica_raw)) if ultima_modifica_raw else None
+        data_titolo = dt_mod.strftime("%d/%m/%Y %H:%M") if dt_mod else "(data non disponibile)"
 
-            if response.status_code == 200:
+        titolo_personalizzato = (job.get("titolo") or "").strip()
+        titolo = titolo_personalizzato if titolo_personalizzato else data_titolo
+        job_enabled = job.get("enabled", True)
+        titolo += "" if job_enabled else "  ⏸ in pausa"
 
-                storico = response.json()
-
-                if not storico:
-                    st.info("Non sono presenti analisi salvate.")
+        with st.expander(titolo):
+            _, col_pause, col_delete = st.columns([8, 2, 2])
+            with col_pause:
+                if job_enabled:
+                    if st.button("⏸ Pausa", key=f"pause_job_{job_id}", use_container_width=True):
+                        if pause_automation_job(job_id):
+                            st.rerun()
                 else:
-
-                    for item in storico:
-                        # Conversione a fuso orario di Roma della data in cui è stata fatta la richiesta
-                        dt_roma = converti_a_roma(item["request_date"])
-                        titolo = dt_roma.strftime(" %d/%m/%Y  %H:%M") if dt_roma else " Data N/D"
-
-                        with st.expander(titolo):
-                            _, col_delete = st.columns([10, 2])
-
-                            with col_delete:
-                                if st.button(
-                                        "Elimina",
-                                        key=f"delete_analysis_{item['_id']}",
-                                        use_container_width=True,
-                                ):
-                                    response = requests.delete(
-                                        f"{API_BASE_URL}/analysis_history/{item['_id']}"
-                                    )
-
-                                    if response.status_code == 200:
-                                        st.success("Analisi eliminata.")
-                                        st.rerun()
-                                    else:
-                                        st.error("Errore durante l'eliminazione.")
-
-                            data_richiesta_roma = dt_roma.strftime("%Y-%m-%d %H:%M:%S") if dt_roma else item[
-                                'request_date']
-                            st.markdown(f"**Data richiesta:** {data_richiesta_roma}")
-
-                            # Mostra l'intervallo temporale salvato così com'è, senza raddoppiare la conversione fuso
-                            format_periodo(
-                                item["data_inizio"], item["data_fine"],
-                                item["ora_inizio"], item["ora_fine"],
-                            )
-
-                            camere = ", ".join(item["camera_ids"]) if item["camera_ids"] else "Tutte"
-
-                            st.markdown(f"**Camere:** {camere}")
-
-                            st.markdown(f"**Numero eventi:** {item['numero_eventi']}")
-
-                            tipi_eventi = ", ".join(item.get("tipi_eventi", [])) if item.get("tipi_eventi") else "Tutti"
-
-                            st.markdown(f"**Tipi evento:** {tipi_eventi}")
-
-                            st.markdown(f"**LLM:** {item.get('LLM', 'N/D')}")
-
-                            st.divider()
-
-                            st.markdown("### Sintesi AI")
-
-                            st.write(item["risposta"])
-
-            else:
-                st.error("Errore durante il recupero delle analisi.")
-
-        elif st.session_state.history_view == "prompt":
-
-            response = requests.get(f"{API_BASE_URL}/prompt_history")
-
-            if response.status_code == 200:
-
-                storico = response.json()
-
-                if not storico:
-                    st.info("Non sono presenti risposte a prompt salvate.")
-                else:
-
-                    for item in storico:
-                        # Conversione a fuso orario di Roma della data della richiesta
-                        dt_roma = converti_a_roma(item["request_date"])
-                        titolo = dt_roma.strftime(" %d/%m/%Y  %H:%M") if dt_roma else " Data N/D"
-
-                        with st.expander(titolo):
-                            _, col_delete = st.columns([10, 2])
-
-                            with col_delete:
-                                if st.button(
-                                        "Elimina",
-                                        key=f"delete_prompt_{item['_id']}",
-                                        use_container_width=True,
-                                ):
-                                    response = requests.delete(
-                                        f"{API_BASE_URL}/prompt_history/{item['_id']}"
-                                    )
-
-                                    if response.status_code == 200:
-                                        st.success("Risposta eliminata.")
-                                        st.rerun()
-                                    else:
-                                        st.error("Errore durante l'eliminazione.")
-
-                            data_richiesta_roma = dt_roma.strftime("%Y-%m-%d %H:%M:%S") if dt_roma else item[
-                                'request_date']
-                            st.markdown(f"**Data richiesta:** {data_richiesta_roma}")
-
-                            # Mostra l'intervallo richiesto così com'è
-                            format_periodo(
-                                item["data_inizio"], item["data_fine"],
-                                item["ora_inizio"], item["ora_fine"],
-                            )
-
-                            camere = ", ".join(item["camera_ids"]) if item["camera_ids"] else "Tutte"
-
-                            st.markdown(f"**Camere:** {camere}")
-
-                            st.markdown(f"**Numero eventi:** {item['numero_eventi']}")
-
-                            tipi_eventi = ", ".join(item.get("tipi_eventi", [])) if item.get("tipi_eventi") else "Tutti"
-
-                            st.markdown(f"**Tipi evento:** {tipi_eventi}")
-
-                            st.markdown(f"**LLM:** {item.get('LLM', 'N/D')}")
-
-                            st.markdown("### Prompt dell'utente")
-
-                            st.info(item["prompt"])
-
-                            st.divider()
-
-                            st.markdown("### Risposta AI")
-
-                            st.write(item["risposta"])
-
-            else:
-                st.error("Errore durante il recupero dei prompt.")
-
-    with tab_scheduler:
-
-        st.subheader("Job di automated periodica")
-
-        jobs = get_automation_jobs()
-
-        if jobs is None:
-            pass
-        elif not jobs:
-            st.info("Non sono presenti job periodici configurati.")
-        else:
-            for job in jobs:
-                job_id = job["_id"]
-
-                ultima_modifica_raw = job.get("ultima_modifica")
-                if ultima_modifica_raw:
-                    dt_mod = converti_a_roma(ultima_modifica_raw)
-                    data_titolo = dt_mod.strftime(" %d/%m/%Y  %H:%M") if dt_mod else " (data non disponibile)"
-                else:
-                    data_titolo = " (data non disponibile)"
-
-                titolo_personalizzato = (job.get("titolo") or "").strip()
-                titolo = f" {titolo_personalizzato}" if titolo_personalizzato else data_titolo
-
-                job_enabled = job.get("enabled", True)
-                titolo = titolo + ("" if job_enabled else "  ⏸ in pausa")
-
-                with st.expander(titolo):
-                    _, col_pause, col_delete = st.columns([8, 2, 2])
-
-                    with col_pause:
-                        if job_enabled:
-                            if st.button(
-                                    "⏸ Pausa",
-                                    key=f"pause_job_{job_id}",
-                                    use_container_width=True,
-                            ):
-                                if pause_automation_job(job_id):
-                                    st.success("Job messo in pausa.")
-                                    st.rerun()
-                        else:
-                            if st.button(
-                                    "▶ Avvia",
-                                    key=f"resume_job_{job_id}",
-                                    use_container_width=True,
-                            ):
-                                if resume_automation_job(job_id):
-                                    st.success("Job riavviato.")
-                                    st.rerun()
-
-                    with col_delete:
-                        if st.button(
-                                "Elimina",
-                                key=f"delete_job_{job_id}",
-                                use_container_width=True,
-                        ):
-                            response = requests.delete(f"{API_BASE_URL}/automation_jobs/{job_id}")
-
-                            if response.status_code == 200:
-                                st.success("Job eliminato.")
-                                st.rerun()
-                            else:
-                                st.error("Errore durante l'eliminazione.")
-
-                    if not job_enabled:
-                        st.warning("Questo job è in pausa: non verrà eseguito finché non viene riavviato.")
-
-                    if titolo_personalizzato:
-                        st.markdown(f"**Ultima modifica:**{data_titolo}")
-
-                    job_start_raw = job.get("start")
-                    job_end_raw = job.get("end")
-                    if job_start_raw and job_end_raw:
-
-                        try:
-                            parti_start = job_start_raw.split("T")
-                            parti_end = job_end_raw.split("T")
-                            format_periodo(
-                                parti_start[0], parti_end[0],
-                                parti_start[1][:8], parti_end[1][:8]
-                            )
-                        except Exception:
-                            format_periodo(job_start_raw, job_end_raw, "", "")
-
-                    camere = ", ".join(job.get("camera_ids", [])) if job.get("camera_ids") else "Tutte"
-                    st.markdown(f"**Telecamere incluse:** {camere}")
-
-                    tipi_eventi = ", ".join(job.get("tipi_evento", [])) if job.get("tipi_evento") else "Tutti"
-                    st.markdown(f"**Tipi evento:** {tipi_eventi}")
-
-                    st.markdown(f"**LLM:** {job.get('modello_LLM') or 'N/D (nessun ciclo completato ancora)'}")
-
-                    if job.get("custom_prompt"):
-                        st.markdown("**Prompt personalizzato:**")
-                        st.info(job["custom_prompt"])
-
-                    st.markdown(f"**Frequenza:** ogni {job.get('interval_minutes', 'N/D')} minuti")
-
-                    ultima_esecuzione_raw = job.get("ultima_esecuzione")
-                    if ultima_esecuzione_raw:
-                        dt_ultima_esecuzione = converti_a_roma(str(ultima_esecuzione_raw))
-                        st.markdown(
-                            f"**Ultimo iter eseguito:** "
-                            f"{dt_ultima_esecuzione.strftime('%d/%m/%Y %H:%M:%S')}" if dt_ultima_esecuzione else "N/D"
-                        )
-                    else:
-                        st.markdown("**Ultimo iter eseguito:** nessuno ancora")
-
-                    ultimo_esito = job.get("ultimo_esito")
-                    if ultimo_esito:
-                        if ultimo_esito.startswith("OK"):
-                            st.caption(f"Esito: {ultimo_esito}")
-                        else:
-                            st.warning(f"Esito: {ultimo_esito}")
-
-                    st.divider()
-                    st.markdown("### Risposta")
-                    risposta = job.get("risposta")
-                    if risposta:
-                        st.write(risposta)
-                    else:
-                        st.caption("Nessuna risposta ancora generata: il job non ha eseguito il primo ciclo.")
-
-                    st.divider()
-
-                    esclusi_ids = job.get("id_eventi_esclusi", []) or []
-                    st.markdown(f"### Eventi esclusi manualmente ({len(esclusi_ids)})")
-
-                    if not esclusi_ids:
-                        st.caption("Nessun evento escluso manualmente per questo job.")
-                    else:
-                        for ev_id in esclusi_ids:
-                            ev = get_event_by_id(ev_id)
-
-                            with st.container(border=True):
-                                col_incl, col_info = st.columns([1, 5])
-
-                                with col_incl:
-                                    if st.button(
-                                            "✓ includi",
-                                            key=f"reinclude_{job_id}_{ev_id}",
-                                            use_container_width=True,
-                                    ):
-                                        r = requests.post(
-                                            f"{API_BASE_URL}/automation_jobs/{job_id}/reinclude/{ev_id}"
-                                        )
-                                        if r.status_code == 200:
-                                            st.success("Evento reincluso.")
-                                            st.rerun()
-                                        else:
-                                            st.error("Errore durante la reinclusione.")
-
-                                with col_info:
-                                    if ev is None:
-                                        st.caption(f"Evento {ev_id} non trovato (potrebbe essere stato eliminato).")
-                                    else:
-                                        tags = ev.get("metadata", {}).get("tags", [])
-                                        dt_ev_roma = converti_a_roma(ev.get('timestamp', ''))
-                                        testo_data_ev = dt_ev_roma.strftime(
-                                            '%d/%m/%Y %H:%M:%S') if dt_ev_roma else ev.get('timestamp', 'N/D')
-
-                                        st.markdown(
-                                            f"**Data:** {testo_data_ev}  \n"
-                                            f"**Location:** {ev.get('location', 'N/D')}  \n"
-                                            f"**Tipo:** {ev.get('event_type', 'N/D')}  \n"
-                                            f"**Descrizione:** {ev.get('description', 'N/D')}  \n"
-                                            f"**Tags:** {', '.join(tags) if tags else 'Nessuno'}"
-                                        )
+                    if st.button("▶ Avvia", key=f"resume_job_{job_id}", use_container_width=True):
+                        if resume_automation_job(job_id):
+                            st.rerun()
+            with col_delete:
+                if st.button("🗑 Elimina", key=f"delete_job_{job_id}", use_container_width=True):
+                    response = requests.delete(f"{API_BASE_URL}/automation_jobs/{job_id}")
+                    if response.status_code == 200:
+                        st.rerun()
+
+            if not job_enabled:
+                st.warning("Questo job è in pausa.")
+
+            job_start_raw, job_end_raw = job.get("start"), job.get("end")
+            if job_start_raw and job_end_raw:
+                try:
+                    parti_start = str(job_start_raw).split("T")
+                    parti_end = str(job_end_raw).split("T")
+                    format_periodo(parti_start[0], parti_end[0], parti_start[1][:8], parti_end[1][:8])
+                except Exception:
+                    format_periodo(job_start_raw, job_end_raw, "", "")
+
+            camere = ", ".join(job.get("camera_ids", [])) if job.get("camera_ids") else "Tutte"
+            st.markdown(f"**Telecamere incluse:** {camere}")
+            tipi_eventi = ", ".join(job.get("tipi_evento", [])) if job.get("tipi_evento") else "Tutti"
+            st.markdown(f"**Tipi evento:** {tipi_eventi}")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PAGINA: STORICO RISPOSTE
+# ──────────────────────────────────────────────────────────────────────────
+def pagina_storico():
+    st.title("Storico risposte")
+    st.caption("Sintesi e risposte AI generate in passato")
+
+    if "history_view" not in st.session_state:
+        st.session_state.history_view = "analysis"
+
+    c1, c2 = st.columns(2)
+    with c1:
+        tipo = "primary" if st.session_state.history_view == "analysis" else "secondary"
+        if st.button("Sintesi passate", use_container_width=True, type=tipo):
+            st.session_state.history_view = "analysis"
+            st.rerun()
+    with c2:
+        tipo = "primary" if st.session_state.history_view == "prompt" else "secondary"
+        if st.button("Risposte ai prompt", use_container_width=True, type=tipo):
+            st.session_state.history_view = "prompt"
+            st.rerun()
 
     st.divider()
 
-# FOOTER
+    kind = st.session_state.history_view
+    storico = get_history(kind)
+
+    if storico is None or not storico:
+        st.info("Non sono presenti elementi salvati.")
+        return
+
+    for item in storico:
+        dt_roma = converti_a_roma(item["request_date"])
+        titolo = dt_roma.strftime("%d/%m/%Y  %H:%M") if dt_roma else "Data N/D"
+
+        with st.expander(titolo):
+            _, col_delete = st.columns([10, 2])
+            with col_delete:
+                if st.button("🗑 Elimina", key=f"delete_{kind}_{item['_id']}", use_container_width=True):
+                    if delete_history_item(kind, item["_id"]):
+                        st.rerun()
+
+            st.write(item["risposta"])
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# ROUTING
+# ──────────────────────────────────────────────────────────────────────────
+if st.session_state.page == "Dashboard":
+    pagina_dashboard()
+elif st.session_state.page == "Impostazioni":
+    pagina_impostazioni()
+elif st.session_state.page == "Storico risposte":
+    pagina_storico()
+
 st.divider()
-st.caption(
-    "Sistema di archiviazione, rilevazione e sintesi eventi — FastAPI + MongoDB Atlas + Ollama Locale + Streamlit"
-)
+st.caption("Sistema di archiviazione, rilevazione e sintesi eventi — FastAPI + Streamlit")
+
+
+#TODO SCHERMATA PRINCIPALE JOB PERIODICO EVENTI CRITICI ULTIME 24H E RIPULIRE

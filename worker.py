@@ -76,7 +76,6 @@ async def execute_automatic_analysis(job_id: str):
 
     limit = config.get("max_events", config.get("default_events", 100))
     custom_prompt = config.get("custom_prompt", "").strip()
-    camera_ids = config.get("camera_ids", [])
     risposta_precedente = config.get("risposta", "").strip()
     analizzati_storico = config.get("id_eventi_analizzati", []) or []
 
@@ -103,10 +102,7 @@ async def execute_automatic_analysis(job_id: str):
 
     logger.info(f"[Job {job_id}] Trovati {len(new_events)} nuovi eventi. Generazione prompt incrementale...")
 
-    start_batch = _parse_ts(new_events[0].get(FIELD_TIMESTAMP)) or datetime.now(LOCAL_TZ)
-    end_batch = _parse_ts(new_events[-1].get(FIELD_TIMESTAMP)) or datetime.now(LOCAL_TZ)
-
-    prompt_base = build_llm_prompt(new_events, start_batch, end_batch, camera_ids, custom_prompt)
+    prompt_base = build_llm_prompt(new_events, custom_prompt)
 
     if risposta_precedente:
         if custom_prompt:
@@ -228,3 +224,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+#TODO FARE CHE JOB PERIODICO NON HA INIZIO E FINE MA SE GLI DICI 20 MINUTI JOB GIORNALIERO POI INCREMENTA QUINDI
+#VA DA 00:00 A 23:59 POI PROSSIMO ITER DA 00:20 A 00:20 DEL GIORNO DOPO ETC

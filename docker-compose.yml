@@ -8,6 +8,7 @@ services:
       - "27017:27017"
     volumes:
       - mongo_data:/data/db
+      - ./mongo-seed:/docker-entrypoint-initdb.d
     networks:
       - rete_sorveglianza
     healthcheck:

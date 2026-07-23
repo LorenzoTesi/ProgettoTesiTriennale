@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from datetime import datetime, timedelta, time
@@ -428,8 +428,6 @@ async def check_llm_status() -> dict:
 #metodo per costruire il prompt per analisi sistematica degli eventi
 def _build_summary_prompt(
     events: list[dict],
-    start: datetime,
-    end: datetime,
 ) -> str:
     righe = []
     for e in events:
@@ -473,8 +471,6 @@ REGOLE DI RISPOSTA:
  - Non aggiungere il tipo di soggetto nelle righe di output.
  - Se una sezione non ha eventi, OMETTILA completamente.
 
-Periodo analizzato: {start.strftime('%d/%m/%Y %H:%M')} → {end.strftime('%d/%m/%Y %H:%M')}
-
 HAI QUESTI EVENTI DA CLASSIFICARE :
 {eventi_txt}
 
@@ -517,15 +513,12 @@ def _build_custom_prompt(events: list[dict], custom_prompt: str) -> str:
 #dispatcher per i due tipi di richieste all'LLM
 def build_llm_prompt(
     events: list[dict],
-    start: datetime,
-    end: datetime,
-    camera_ids: list[str],
     custom_prompt: Optional[str] = None,
 ) -> str:
 
     if custom_prompt and custom_prompt.strip():
         return _build_custom_prompt(events, custom_prompt.strip())
-    return _build_summary_prompt(events, start, end, camera_ids)
+    return _build_summary_prompt(events)
 
 
 
@@ -701,7 +694,7 @@ async def generate_summary(req: SummaryRequest):
                 "Controlla che il simulatore abbia inviato eventi in questo intervallo."
             ),
         )
-    prompt = build_llm_prompt(events,req.start, end, req.camera_ids, req.custom_prompt)
+    prompt = build_llm_prompt(events, req.custom_prompt)
     sintesi = await call_llm(prompt, n_events=len(events))
 
     llm_backend_label = (
@@ -745,6 +738,127 @@ async def generate_summary(req: SummaryRequest):
     }
 
 
+
+
+# ENDPOINT — SINTESI ASINCRONA (per la UI: crea subito la "scheda" e lancia
+# la generazione in background, così l'utente non resta bloccato in attesa)
+@app.post("/summaries/richiedi", tags=["Sintesi LLM"])
+async def richiedi_summary(req: SummaryRequest, background_tasks: BackgroundTasks):
+    end = req.resolved_end()
+
+    if end <= req.start:
+        raise HTTPException(status_code=400, detail="'end' deve essere successivo a 'start'")
+
+    query = _build_time_query(req.start, end)
+
+    if req.camera_ids:
+        query[FIELD_CAMERA] = {"$in": req.camera_ids}
+
+    if req.selected_events:
+        events = req.selected_events
+    else:
+        cursor = collection.find(query).sort("timestamp", 1)
+        events = [doc_to_event(doc) async for doc in cursor]
+
+    if not events:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Nessun evento trovato tra {req.start.isoformat()} e {end.isoformat()}. "
+                "Controlla che il simulatore abbia inviato eventi in questo intervallo."
+            ),
+        )
+
+    is_prompt = bool(req.custom_prompt and req.custom_prompt.strip())
+    target_collection = prompt_collection if is_prompt else analysis_collection
+
+    event_types = sorted({
+        e.get(FIELD_TYPE)
+        for e in events
+        if e.get(FIELD_TYPE)
+    })
+
+    # documento "scheda" creato subito con stato "in_corso": la UI può già
+    # mostrarlo e interrogarlo mentre l'LLM lavora in background
+    documento = {
+        "request_date": datetime.now(LOCAL_TZ),
+        "camera_ids": req.camera_ids,
+        "numero_eventi": len(events),
+        "tipi_eventi": event_types,
+        "data_inizio": req.start.date().isoformat(),
+        "data_fine": end.date().isoformat(),
+        "ora_inizio": req.start.time().isoformat(timespec="seconds"),
+        "ora_fine": end.time().isoformat(timespec="seconds"),
+        "LLM": None,
+        "risposta": None,
+        "stato": "in_corso",
+    }
+    if is_prompt:
+        documento["prompt"] = req.custom_prompt
+
+    result = await target_collection.insert_one(documento)
+    scheda_id = str(result.inserted_id)
+
+    background_tasks.add_task(
+        _esegui_analisi_in_background, scheda_id, is_prompt, events, req, end,
+    )
+
+    return {"id": scheda_id, "tipo": "prompt" if is_prompt else "standard", "stato": "in_corso"}
+
+
+async def _esegui_analisi_in_background(scheda_id: str, is_prompt: bool, events, req, end):
+    target_collection = prompt_collection if is_prompt else analysis_collection
+    try:
+        prompt = build_llm_prompt(events, req.custom_prompt)
+        sintesi = await call_llm(prompt, n_events=len(events))
+        llm_backend_label = (
+            f"OpenAI ({OPENAI_MODEL})" if LLM_PROVIDER == "openai"
+            else f"Ollama ({OLLAMA_MODEL})"
+        )
+        await target_collection.update_one(
+            {"_id": ObjectId(scheda_id)},
+            {"$set": {"risposta": sintesi, "LLM": llm_backend_label, "stato": "completato"}}
+        )
+    except Exception as ex:
+        await target_collection.update_one(
+            {"_id": ObjectId(scheda_id)},
+            {"$set": {"stato": "errore", "errore": str(ex)}}
+        )
+
+
+@app.get("/summaries/{scheda_id}", tags=["Sintesi LLM"])
+async def get_summary_scheda(scheda_id: str, tipo: str = "standard"):
+    try:
+        oid = ObjectId(scheda_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID non valido")
+
+    target_collection = prompt_collection if tipo == "prompt" else analysis_collection
+    doc = await target_collection.find_one({"_id": oid})
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Scheda non trovata")
+
+    doc["_id"] = str(doc["_id"])
+    # le schede create prima di questa funzionalità non hanno "stato": sono
+    # per forza già completate, quindi lo deduciamo dalla presenza della risposta
+    doc.setdefault("stato", "completato" if doc.get("risposta") else "in_corso")
+    return doc
+
+
+@app.post("/summaries/{scheda_id}/nascondi", tags=["Sintesi LLM"])
+async def nascondi_summary_scheda(scheda_id: str, tipo: str = "standard"):
+    # Nasconde la scheda solo dalla schermata principale (Dashboard): il record
+    # resta intatto e continua ad essere consultabile nello Storico risposte.
+    try:
+        oid = ObjectId(scheda_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID non valido")
+
+    target_collection = prompt_collection if tipo == "prompt" else analysis_collection
+    result = await target_collection.update_one({"_id": oid}, {"$set": {"nascosta": True}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Scheda non trovata")
+    return {"status": "nascosta", "id": scheda_id}
 
 
 #metodi per salvare le risposte in mongodb
@@ -809,6 +923,8 @@ async def analysis_history():
 
     async for doc in cursor:
         doc["_id"] = str(doc["_id"])
+        doc.setdefault("stato", "completato" if doc.get("risposta") else "in_corso")
+        doc.setdefault("nascosta", False)
         risultati.append(doc)
 
     return risultati
@@ -825,6 +941,8 @@ async def prompt_history():
 
     async for doc in cursor:
         doc["_id"] = str(doc["_id"])
+        doc.setdefault("stato", "completato" if doc.get("risposta") else "in_corso")
+        doc.setdefault("nascosta", False)
         risultati.append(doc)
 
     return risultati
@@ -982,3 +1100,10 @@ async def reinclude_event(job_id: str, event_id: str):
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Job non trovato")
     return {"status": "reincluded", "event_id": event_id}
+
+@app.get("/analysis_status", tags=["Sintesi LLM"])
+async def get_analysis_status():
+    # Recupera le ultime analisi per mostrare la finestrina/badge
+    cursor = analysis_collection.find().sort("request_date", -1).limit(10)
+    # Oppure includi anche le risposte dei prompt
+    return [doc_to_event(doc) async for doc in cursor]
