@@ -4,7 +4,7 @@ import requests
 import pandas as pd
 import yaml
 import time as pytime
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 import os
 
@@ -27,9 +27,7 @@ BADGE = {
     "N/D": "⚪ N/D",
 }
 
-# ──────────────────────────────────────────────────────────────────────────
-# CSS PERSONALIZZATO (Responsive layout & pulizia pulsanti)
-# ──────────────────────────────────────────────────────────────────────────
+# CSS PERSONALIZZATO
 st.markdown("""
 <style>
 div[data-testid="stMetric"] {
@@ -45,27 +43,22 @@ div[data-testid="stMetric"] {
     padding: 14px 18px;
 }
 
-/* Permette al testo nelle celle di andare a capo invece di sovrapporsi
-   quando lo spazio orizzontale è stretto (fix collasso testo su mobile) */
 div[data-testid="stColumn"] {
     white-space: normal !important;
     overflow-wrap: break-word !important;
     word-break: break-word !important;
 }
 
-/* Riduzione padding interno per layout responsive */
 div[data-testid="stColumn"] > div {
     padding-left: 4px !important;
     padding-right: 4px !important;
 }
 
-/* Le etichette delle colonne nell'intestazione restano su una riga sola */
 div[class*="st-key-table_header"] .col-label {
     white-space: nowrap;
     font-weight: 600;
 }
 
-/* Frecce di ordinamento compatte, impilate accanto al nome colonna */
 div[class*="st-key-sort_"] {
     line-height: 1 !important;
 }
@@ -83,7 +76,6 @@ div[class*="st-key-sort_"]:last-child button {
     margin-bottom: 0px !important;
 }
 
-/* Pulsante escludi/Includi compatto e senza a capo */
 .btn-action button {
     padding: 2px 6px !important;
     font-size: 12px !important;
@@ -92,7 +84,6 @@ div[class*="st-key-sort_"]:last-child button {
     white-space: nowrap !important;
 }
 
-/* Riga di "schede" di analisi: scorrimento orizzontale forzato */
 div[data-testid="stHorizontalBlock"]:has(div[class*="st-key-scheda_"]) {
     display: flex !important;
     flex-direction: row !important;
@@ -102,7 +93,6 @@ div[data-testid="stHorizontalBlock"]:has(div[class*="st-key-scheda_"]) {
     padding-bottom: 10px !important;
 }
 
-/* Disabilita la riduzione e la crescita forzata delle colonne all'interno della riga schede */
 div[data-testid="stHorizontalBlock"]:has(div[class*="st-key-scheda_"]) > div[data-testid="stColumn"] {
     flex: 0 0 auto !important;
     min-width: 140px !important;
@@ -110,14 +100,12 @@ div[data-testid="stHorizontalBlock"]:has(div[class*="st-key-scheda_"]) > div[dat
     width: auto !important;
 }
 
-/* Stile pulsanti schede */
 div[class*="st-key-scheda_"] button {
     white-space: nowrap !important;
     border-radius: 8px !important;
     font-size: 13px !important;
 }
 
-/* Pulsante "x": rimuove la scheda solo dalla pagina, non dallo storico */
 div[class*="st-key-scheda_x_"] button {
     padding: 0px !important;
     min-height: 22px !important;
@@ -129,22 +117,18 @@ div[class*="st-key-scheda_x_"] button {
     line-height: 1 !important;
 }
 
-/* In corso: bordo/sfondo ambra */
 div[class*="st-key-scheda_in_corso_"] button {
     border-color: rgba(245,158,11,0.55) !important;
     background: rgba(245,158,11,0.10) !important;
 }
-/* Errore: bordo/sfondo rosso */
 div[class*="st-key-scheda_errore_"] button {
     border-color: rgba(220,50,50,0.5) !important;
     background: rgba(220,50,50,0.08) !important;
 }
-/* Completata: bordo blu leggero */
 div[class*="st-key-scheda_completato_"] button {
     border-color: rgba(37,99,235,0.35) !important;
 }
 
-/* Sidebar più stretta di default (resta comunque ridimensionabile a mano) */
 section[data-testid="stSidebar"] {
     width: 250px !important;
 }
@@ -154,9 +138,7 @@ section[data-testid="stSidebar"] > div:first-child {
 </style>
 """, unsafe_allow_html=True)
 
-# ──────────────────────────────────────────────────────────────────────────
 # CONFIGURAZIONE DI DOMINIO
-# ──────────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_domain_config():
     try:
@@ -209,12 +191,17 @@ def classifica_criticita(evento: dict) -> tuple[str, str]:
     return "Basso", "Comportamento ordinario per orario e zona"
 
 
-# ──────────────────────────────────────────────────────────────────────────
 # HELPER GENERICI
-# ──────────────────────────────────────────────────────────────────────────
-def converti_a_roma(dt_str):
+def converti_a_roma(dt_input):
+    if not dt_input:
+        return None
     try:
-        dt_utc = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        if isinstance(dt_input, str):
+            dt_utc = datetime.fromisoformat(dt_input.replace("Z", "+00:00"))
+        else:
+            dt_utc = dt_input
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
         return dt_utc.astimezone(FUSO_ROMA)
     except Exception:
         return None
@@ -225,9 +212,7 @@ def format_periodo(data_inizio, data_fine, ora_inizio, ora_fine):
     st.markdown(f"**Intervallo orario:** {ora_inizio} → {ora_fine}")
 
 
-# ──────────────────────────────────────────────────────────────────────────
 # CHIAMATE API
-# ──────────────────────────────────────────────────────────────────────────
 def get_cameras():
     try:
         r = requests.get(f"{API_BASE_URL}/cameras", timeout=10)
@@ -263,8 +248,6 @@ def generate_summary(payload):
 
 
 def richiedi_analisi_async(payload):
-    """Crea subito la 'scheda' di analisi: il backend risponde all'istante con
-    un id e lancia la generazione LLM in background."""
     try:
         r = requests.post(f"{API_BASE_URL}/summaries/richiedi", json=payload, timeout=30)
         r.raise_for_status()
@@ -277,7 +260,6 @@ def richiedi_analisi_async(payload):
 
 
 def get_scheda_analisi(scheda_id: str, tipo: str):
-    """Interroga lo stato/risultato di una scheda di analisi (in_corso / completato / errore)."""
     try:
         r = requests.get(f"{API_BASE_URL}/summaries/{scheda_id}", params={"tipo": tipo}, timeout=15)
         r.raise_for_status()
@@ -290,8 +272,6 @@ def get_scheda_analisi(scheda_id: str, tipo: str):
 
 
 def nascondi_scheda_analisi(scheda_id: str, tipo: str):
-    """Nasconde la scheda dalla Dashboard in modo permanente (persistito lato
-    server): il record resta comunque nello Storico risposte."""
     try:
         r = requests.post(f"{API_BASE_URL}/summaries/{scheda_id}/nascondi", params={"tipo": tipo}, timeout=15)
         r.raise_for_status()
@@ -365,9 +345,7 @@ def delete_history_item(kind: str, item_id: str):
         return False
 
 
-# ──────────────────────────────────────────────────────────────────────────
 # SESSION STATE
-# ──────────────────────────────────────────────────────────────────────────
 if "page" not in st.session_state:
     st.session_state.page = "Dashboard"
 
@@ -384,12 +362,9 @@ if "sort_column" not in st.session_state:
 if "sort_ascending" not in st.session_state:
     st.session_state.sort_ascending = False
 if "scheda_attiva" not in st.session_state:
-    # (id, tipo) della scheda di analisi attualmente aperta; None = vista eventi
     st.session_state.scheda_attiva = None
 
-# ──────────────────────────────────────────────────────────────────────────
 # SIDEBAR
-# ──────────────────────────────────────────────────────────────────────────
 st.sidebar.markdown("## Sistema di sorveglianza intelligente")
 st.sidebar.caption("Monitoraggio e analisi degli eventi")
 st.sidebar.divider()
@@ -414,8 +389,8 @@ if st.session_state.page == "Dashboard":
     start_time = st.sidebar.time_input("Ora iniziale", value=time(0, 1))
     end_time = st.sidebar.time_input("Ora finale", value=time(23, 59))
 
-    start_dt = datetime.combine(start_date, start_time)
-    end_dt = datetime.combine(end_date, end_time)
+    start_dt = datetime.combine(start_date, start_time).replace(tzinfo=FUSO_ROMA)
+    end_dt = datetime.combine(end_date, end_time).replace(tzinfo=FUSO_ROMA)
 
     tipi_evento_sel = st.sidebar.multiselect(
         "Tipo evento",
@@ -438,8 +413,8 @@ if st.session_state.page == "Dashboard":
         st.session_state.sort_ascending = False
         st.rerun()
 else:
-    start_dt = datetime.combine(date.today() - timedelta(days=1), time(0, 1))
-    end_dt = datetime.combine(date.today(), time(23, 59))
+    start_dt = datetime.combine(date.today() - timedelta(days=1), time(0, 1)).replace(tzinfo=FUSO_ROMA)
+    end_dt = datetime.combine(date.today(), time(23, 59)).replace(tzinfo=FUSO_ROMA)
     tipi_evento_sel, ricerca_libera, limit = [], "", 0
 
 st.sidebar.divider()
@@ -447,11 +422,8 @@ st.sidebar.caption(f"Backend: `{API_BASE_URL}`")
 
 
 ICONA_STATO = {"in_corso": "⏳", "errore": "⚠️", "completato": "✅"}
-ETICHETTA_STATO = {"in_corso": "In corso", "errore": "Errore", "completato": "Pronta"}
 
 def render_schede_analisi(storico_analisi, storico_prompt):
-    """Mostra le richieste di analisi AI come schede."""
-
     schede = [{**it, "tipo": "standard"} for it in storico_analisi]
     schede += [{**it, "tipo": "prompt"} for it in storico_prompt]
 
@@ -459,9 +431,7 @@ def render_schede_analisi(storico_analisi, storico_prompt):
         return
 
     def _ts(it):
-        return converti_a_roma(it.get("request_date", "")) or datetime.min.replace(
-            tzinfo=FUSO_ROMA
-        )
+        return converti_a_roma(it.get("request_date", "")) or datetime.min.replace(tzinfo=FUSO_ROMA)
 
     schede.sort(key=_ts, reverse=True)
     schede = [s for s in schede if not s.get("nascosta")]
@@ -472,22 +442,16 @@ def render_schede_analisi(storico_analisi, storico_prompt):
     st.markdown("")
     st.markdown("##### 🗂️ Le tue analisi")
 
-    # Riga di colonne
     cols = st.columns(len(schede), gap="small")
 
     for col, it in zip(cols, schede):
-
         scheda_id = it["_id"]
         tipo = it["tipo"]
-        stato = it.get(
-            "stato",
-            "completato" if it.get("risposta") else "in_corso"
-        )
+        stato = it.get("stato", "completato" if it.get("risposta") else "in_corso")
 
         testo_data = _ts(it).strftime("%d/%m/%Y %H:%M")
 
         with col:
-
             if st.button(
                 f"{ICONA_STATO.get(stato,'✅')} {testo_data}",
                 key=f"scheda_{stato}_{scheda_id}",
@@ -504,9 +468,8 @@ def render_schede_analisi(storico_analisi, storico_prompt):
             ):
                 if nascondi_scheda_analisi(scheda_id, tipo):
                     st.rerun()
+
 def render_vista_risposta_analisi():
-    """Vista a schermo intero per una scheda: se l'analisi è ancora in corso
-    mostra uno spinner e ricontrolla periodicamente, altrimenti la risposta."""
     scheda_id, tipo = st.session_state.scheda_attiva
 
     if st.button("← Torna agli eventi"):
@@ -541,9 +504,7 @@ def render_vista_risposta_analisi():
         st.markdown(scheda.get("risposta") or "_Nessuna risposta disponibile._")
 
 
-# ──────────────────────────────────────────────────────────────────────────
 # PAGINA: DASHBOARD (HOME)
-# ──────────────────────────────────────────────────────────────────────────
 def pagina_dashboard():
     st.title("Dashboard")
     st.caption("Monitoraggio e analisi degli eventi")
@@ -562,7 +523,7 @@ def pagina_dashboard():
     if len(tipi_evento_sel) > 1:
         eventi_periodo = [e for e in eventi_periodo if e["event_type"] in tipi_evento_sel]
 
-    now = datetime.now()
+    now = datetime.now(FUSO_ROMA)
     params_24h = {"start": (now - timedelta(hours=24)).isoformat(), "end": now.isoformat(), "limit": 0}
     dati_24h = get_events(params_24h)
 
@@ -674,8 +635,6 @@ def pagina_dashboard():
                 "selected_events": eventi_inclusi_analisi,
                 "camera_ids": camere_attive,
             }
-            # la richiesta torna subito con l'id della scheda: l'LLM lavora
-            # in background sul server, l'utente non resta bloccato in attesa
             esito = richiedi_analisi_async(payload)
             if esito:
                 st.session_state.scheda_attiva = (esito["id"], esito["tipo"])
@@ -735,12 +694,8 @@ def pagina_dashboard():
     end_idx = start_idx + per_pagina
     df_page = df_sorted.iloc[start_idx:end_idx].reset_index(drop=True)
 
-    # ── Intestazione tabella Responsive ──
-    # Tutti i campi dati sono ordinabili; "Azione" resta escluso perché non è un dato
-    # ma la colonna dei pulsanti Escludi/Includi.
     COLONNE_ORDINABILI = {"Data e ora", "Telecamera", "Posizione", "Tipo", "Descrizione", "Confidenza"}
 
-    # Proporzioni ricalibrate per garantire respiro a ogni colonna
     header_widths = [2.2, 1.8, 2.2, 1.5, 3.8, 1.5, 1.2]
     header_labels = ["Data e ora", "Telecamera", "Posizione", "Tipo", "Descrizione", "Confidenza", "Azione"]
 
@@ -757,7 +712,6 @@ def pagina_dashboard():
                         up_active = is_curr_col and st.session_state.sort_ascending
                         down_active = is_curr_col and not st.session_state.sort_ascending
 
-                        # Nome colonna + due freccette compatte impilate (▲ crescente / ▼ decrescente)
                         c_head1, c_head2 = st.columns([0.8, 0.2])
                         with c_head1:
                             st.markdown(f'<span class="col-label">{label}</span>', unsafe_allow_html=True)
@@ -781,7 +735,6 @@ def pagina_dashboard():
 
         st.divider()
 
-        # Righe dati
         for _, row in df_page.iterrows():
             event_id = row["_id"]
             escluso = event_id in st.session_state.excluded_events
@@ -818,7 +771,6 @@ def pagina_dashboard():
 
             st.divider()
 
-    # Paginazione
     col_prev, col_info, col_next = st.columns([1, 3, 1])
     with col_prev:
         if st.button("← Precedente", disabled=st.session_state.table_page <= 1, use_container_width=True):
@@ -836,9 +788,7 @@ def pagina_dashboard():
             st.rerun()
 
 
-# ──────────────────────────────────────────────────────────────────────────
 # PAGINA: IMPOSTAZIONI
-# ──────────────────────────────────────────────────────────────────────────
 def pagina_impostazioni():
     st.title("Impostazioni")
     st.caption("Configura ed esegui l'analisi automatica periodica degli eventi")
@@ -850,60 +800,64 @@ def pagina_impostazioni():
         col1, col2 = st.columns(2)
         with col1:
             job_camere = st.multiselect("Telecamere incluse (vuoto = tutte)", camera_options)
-            job_tipi = st.multiselect("Tipi evento inclusi (vuoto = tutti)", ["movement", "idle", "crowd"])
-            job_titolo = st.text_input("Titolo job (opzionale)", placeholder="Es. Monitoraggio ingresso notturno")
         with col2:
-            job_start_date = st.date_input("Data inizio periodo", value=date.today(), key="job_start_date")
-            job_start_time = st.time_input("Ora inizio periodo", value=time(0, 0), key="job_start_time")
-            job_end_date = st.date_input("Data fine periodo", value=date.today(), key="job_end_date")
-            job_end_time = st.time_input("Ora fine periodo", value=time(23, 59), key="job_end_time")
+            job_tipi = st.multiselect("Tipi evento inclusi (vuoto = tutti)", ["movement", "idle", "crowd"])
 
-        st.markdown("**Frequenza di esecuzione**")
-        col_20, col_40, col_60, col_custom = st.columns(4)
+        job_prompt = st.text_area(
+            "Prompt personalizzato (opzionale)",
+            placeholder="Es. Segnala solo eventi con un elevato livello di attenzione o anomalie particolari.",
+        )
+
+        st.divider()
+
+        job_titolo = st.text_input("Titolo del job*", placeholder="Es. Monitoraggio continuo ingresso")
+
+        st.markdown("**Frequenza di esecuzione (in minuti)**")
+
         if "job_interval" not in st.session_state:
             st.session_state.job_interval = 30
-        if col_20.button("Ogni 20 min", use_container_width=True):
-            st.session_state.job_interval = 20
-        if col_40.button("Ogni 40 min", use_container_width=True):
-            st.session_state.job_interval = 40
-        if col_60.button("Ogni 60 min", use_container_width=True):
+
+        col_30, col_60, col_1440, col_custom = st.columns(4)
+
+        if col_30.button("Ogni 30 min", use_container_width=True):
+            st.session_state.job_interval = 30
+        if col_60.button("Ogni ora", use_container_width=True):
             st.session_state.job_interval = 60
+        if col_1440.button("Ogni giorno", use_container_width=True):
+            st.session_state.job_interval = 1440
+
         with col_custom:
             custom_interval = st.number_input(
-                "Personalizzata (min)", min_value=1, step=1,
-                value=st.session_state.job_interval, label_visibility="collapsed",
+                "Personalizzato (min)",
+                min_value=1,
+                step=1,
+                value=st.session_state.job_interval,
+                label_visibility="collapsed",
             )
             st.session_state.job_interval = int(custom_interval)
 
-        st.caption(f"Frequenza selezionata: ogni **{st.session_state.job_interval}** minuti")
+        st.caption(f"Frequenza selezionata: **Ogni {st.session_state.job_interval} minuti**")
 
-        job_prompt = st.text_area(
-            "Prompt personalizzato (lascia vuoto per la sintesi standard)",
-            placeholder="Es. Segnala solo eventi relativi alla camera blindata",
-        )
-        job_max_events = 0
-
+        st.write("")
         if st.button("Crea job periodico", type="primary"):
-            job_start_dt = datetime.combine(job_start_date, job_start_time)
-            job_end_dt = datetime.combine(job_end_date, job_end_time)
-            payload = {
-                "camera_ids": job_camere,
-                "tipi_evento": job_tipi,
-                "custom_prompt": job_prompt if job_prompt else None,
-                "titolo": job_titolo.strip() if job_titolo.strip() else None,
-                "max_events": job_max_events,
-                "interval_minutes": st.session_state.job_interval,
-                "excluded_ids": [],
-                "start": job_start_dt.isoformat(),
-                "end": job_end_dt.isoformat(),
-            }
-            with st.spinner("Creazione job in corso..."):
-                result = create_automation_job(payload)
-            if result:
-                st.success("Job creato correttamente.")
-                st.rerun()
+            if not job_titolo.strip():
+                st.error("Il titolo del job è obbligatorio.")
+            else:
+                payload = {
+                    "titolo": job_titolo.strip(),
+                    "camera_ids": job_camere,
+                    "tipi_evento": job_tipi,
+                    "custom_prompt": job_prompt.strip() if job_prompt.strip() else None,
+                    "interval_minutes": st.session_state.job_interval,
+                }
+                with st.spinner("Creazione job in corso..."):
+                    result = create_automation_job(payload)
+                if result:
+                    st.success("Job creato correttamente.")
+                    st.rerun()
 
     st.divider()
+
     st.markdown("### Job configurati")
 
     jobs = get_automation_jobs()
@@ -915,17 +869,14 @@ def pagina_impostazioni():
 
     for job in jobs:
         job_id = job["_id"]
-
-        ultima_modifica_raw = job.get("ultima_modifica")
-        dt_mod = converti_a_roma(str(ultima_modifica_raw)) if ultima_modifica_raw else None
-        data_titolo = dt_mod.strftime("%d/%m/%Y %H:%M") if dt_mod else "(data non disponibile)"
-
-        titolo_personalizzato = (job.get("titolo") or "").strip()
-        titolo = titolo_personalizzato if titolo_personalizzato else data_titolo
         job_enabled = job.get("enabled", True)
-        titolo += "" if job_enabled else "  ⏸ in pausa"
+        titolo_job = job.get("titolo") or "Job Senza Titolo"
 
-        with st.expander(titolo):
+        display_title = f"{'▶' if job_enabled else '⏸'} {titolo_job}"
+        if not job_enabled:
+            display_title += " (In pausa)"
+
+        with st.expander(display_title, expanded=False):
             _, col_pause, col_delete = st.columns([8, 2, 2])
             with col_pause:
                 if job_enabled:
@@ -942,27 +893,43 @@ def pagina_impostazioni():
                     if response.status_code == 200:
                         st.rerun()
 
-            if not job_enabled:
-                st.warning("Questo job è in pausa.")
-
-            job_start_raw, job_end_raw = job.get("start"), job.get("end")
-            if job_start_raw and job_end_raw:
-                try:
-                    parti_start = str(job_start_raw).split("T")
-                    parti_end = str(job_end_raw).split("T")
-                    format_periodo(parti_start[0], parti_end[0], parti_start[1][:8], parti_end[1][:8])
-                except Exception:
-                    format_periodo(job_start_raw, job_end_raw, "", "")
-
             camere = ", ".join(job.get("camera_ids", [])) if job.get("camera_ids") else "Tutte"
-            st.markdown(f"**Telecamere incluse:** {camere}")
             tipi_eventi = ", ".join(job.get("tipi_evento", [])) if job.get("tipi_evento") else "Tutti"
+            interval = job.get("interval_minutes", 30)
+            custom_prompt = job.get("custom_prompt")
+
+            st.markdown(f"**Frequenza:** ogni {interval} minuti")
+            st.markdown(f"**Telecamere:** {camere}")
             st.markdown(f"**Tipi evento:** {tipi_eventi}")
+            if custom_prompt:
+                st.markdown(f"**Prompt personalizzato:** *{custom_prompt}*")
 
+            st.divider()
 
-# ──────────────────────────────────────────────────────────────────────────
+            st.markdown("#### 📋 Storico Analisi Eseguite")
+            elenco_analisi = job.get("analisi", [])
+
+            if not elenco_analisi:
+                st.caption("Nessuna analisi ancora eseguita da questo job.")
+            else:
+                for idx, item in enumerate(elenco_analisi):
+                    ts_exec = item.get("timestamp_esecuzione")
+                    if ts_exec:
+                        dt_exec = converti_a_roma(str(ts_exec))
+                        data_ora_str = dt_exec.strftime("%d/%m/%Y %H:%M:%S") if dt_exec else str(ts_exec)
+                    else:
+                        data_ora_str = "N/D"
+
+                    num_eventi = item.get("numero_eventi", 0)
+                    risposta_llm = item.get("risposta", "Nessun dettaglio disponibile.")
+                    modello = item.get("modello_LLM", "N/D")
+
+                    with st.container(border=True):
+                        st.markdown(f"**Esecuzione delle {data_ora_str}** — *Eventi analizzati: {num_eventi}*")
+                        st.write(risposta_llm)
+                        st.caption(f"Modello: {modello}")
+
 # PAGINA: STORICO RISPOSTE
-# ──────────────────────────────────────────────────────────────────────────
 def pagina_storico():
     st.title("Storico risposte")
     st.caption("Sintesi e risposte AI generate in passato")
@@ -1005,9 +972,7 @@ def pagina_storico():
             st.write(item["risposta"])
 
 
-# ──────────────────────────────────────────────────────────────────────────
 # ROUTING
-# ──────────────────────────────────────────────────────────────────────────
 if st.session_state.page == "Dashboard":
     pagina_dashboard()
 elif st.session_state.page == "Impostazioni":

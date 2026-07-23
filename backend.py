@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -9,6 +9,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 import httpx
 import os
+import re
 import yaml
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, APIConnectionError, APIStatusError, APITimeoutError
@@ -189,6 +190,17 @@ class Event(BaseModel):
             raise ValueError(f"event_type deve essere uno di: {ALLOWED_EVENT_TYPES}")
         return v
 
+    @field_validator("timestamp")
+    @classmethod
+    def normalize_timestamp(cls, v: datetime) -> datetime:
+        # Se il timestamp arriva senza timezone (es. da una sorgente locale),
+        # assumiamo sia orario locale (Europe/Rome) e lo convertiamo esplicitamente
+        # in UTC, in modo che venga salvato in Mongo come BSON Date coerente e
+        # confrontabile con le query del worker/backend, che lavorano sempre in UTC.
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=LOCAL_TZ)
+        return v.astimezone(timezone.utc)
+
 class SummaryRequest(BaseModel):
     start: datetime = Field(
         default_factory=datetime.now,
@@ -215,30 +227,13 @@ class SummaryRequest(BaseModel):
         return datetime.now().replace(hour=23, minute=59, second=59, microsecond=0)
 
 
+# --- SCHEMA PYDANTIC JOB PERIODICI ---
 class AutomationJobCreate(BaseModel):
+    titolo: str = Field(..., description="Titolo identificativo del job periodico")
     camera_ids: list[str] = Field(default_factory=list, description="Telecamere abilitate; vuoto = tutte")
     tipi_evento: list[str] = Field(default_factory=list, description="Tipi evento da includere; vuoto = tutti")
-    custom_prompt: Optional[str] = Field(default=None, description="Prompt personalizzato opzionale")
-    titolo: Optional[str] = Field(default=None, description="Titolo descrittivo del job, opzionale")
-    max_events: int = Field(default=DEFAULT_EVENTS_LIMIT, ge=0, le=MAX_EVENTS_LIMIT)
-    interval_minutes: int = Field(..., gt=0, description="Frequenza di esecuzione in minuti")
-    excluded_ids: list[str] = Field(
-        default_factory=list,
-        description="_id di eventi da escludere fin dalla creazione del job (opzionale)"
-    )
-    start: datetime = Field(
-        ...,
-        description="Data e ora di inizio del periodo (stessa data+ora del form di analisi manuale)"
-    )
-    end: Optional[datetime] = Field(
-        default=None,
-        description="Data e ora di fine periodo. Se omesso, fine della giornata corrente."
-    )
-
-    def resolved_end(self) -> datetime:
-        if self.end is not None:
-            return self.end
-        return datetime.now().replace(hour=23, minute=59, second=59, microsecond=0)
+    interval_minutes: int = Field(..., gt=0, description="Frequenza di esecuzione in minuti (es. 30, 60, 1440)")
+    custom_prompt: Optional[str] = Field(default=None, description="Istruzioni o prompt personalizzato per l'LLM")
 
     @field_validator("tipi_evento")
     @classmethod
@@ -252,7 +247,7 @@ class AutomationJobCreate(BaseModel):
 # FUNZIONI DI UTILITY
 def event_to_doc(event: Event) -> dict:
     doc = event.model_dump()
-    doc["timestamp"] = event.timestamp.isoformat()
+    doc["timestamp"] = event.timestamp
     return doc
 
 
@@ -260,47 +255,100 @@ def doc_to_event(doc: dict) -> dict:
     doc["_id"] = str(doc["_id"])
     return doc
 
-def _build_time_query(start: datetime, end: datetime) -> dict:
-    start_time = start.time()
-    end_time = end.time()
+def _to_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=LOCAL_TZ)
+    return dt.astimezone(timezone.utc)
 
-    current_day = start.date()
-    last_day = end.date()
+def _build_time_query(start: datetime, end: datetime) -> dict:
+    start_utc = _to_utc(start)
+    end_utc = _to_utc(end)
+
+    start_time = start_utc.time()
+    end_time = end_utc.time()
+
+    current_day = start_utc.date()
+    last_day = end_utc.date()
 
     clauses = []
 
     while current_day <= last_day:
 
-        window_start = datetime.combine(current_day, start_time)
+        window_start = datetime.combine(current_day, start_time, tzinfo=timezone.utc)
 
         if end_time >= start_time:
             # stessa giornata
-            window_end = datetime.combine(current_day, end_time)
+            window_end = datetime.combine(current_day, end_time, tzinfo=timezone.utc)
 
         elif current_day < last_day:
             # attraversa la mezzanotte
             window_end = datetime.combine(
                 current_day + timedelta(days=1),
-                end_time
+                end_time,
+                tzinfo=timezone.utc
             )
         else:
 
             window_end = datetime.combine(
                 current_day,
-                time(23, 59, 59, 999999)
+                time(23, 59, 59, 999999),
+                tzinfo=timezone.utc
             )
 
-        clauses.append({
-            FIELD_TIMESTAMP: {
+        # Finestra locale corrispondente, usata per il fallback su stringhe naive
+        window_start_local = window_start.astimezone(LOCAL_TZ)
+        window_end_local = window_end.astimezone(LOCAL_TZ)
+
+        clauses.extend([
+            # 1. Stringhe ISO con offset UTC esplicito (es. '...+00:00')
+            {FIELD_TIMESTAMP: {
                 "$gte": window_start.isoformat(),
                 "$lte": window_end.isoformat()
-            }
-        })
+            }},
+            # 2. Stringhe naive in orario locale (es. dati storici tipo init.js)
+            {FIELD_TIMESTAMP: {
+                "$gte": window_start_local.strftime("%Y-%m-%dT%H:%M:%S"),
+                "$lte": window_end_local.strftime("%Y-%m-%dT%H:%M:%S")
+            }},
+            # 3. Veri oggetti Date BSON (comportamento attuale dopo la normalizzazione)
+            {FIELD_TIMESTAMP: {
+                "$gte": window_start,
+                "$lte": window_end
+            }},
+        ])
 
         current_day += timedelta(days=1)
 
     return {"$or": clauses}
 
+#calcola intervallo temporale per job periodici
+def _build_last_Nminutes_query(reference: datetime, minutes: int) -> dict:
+    ref_utc = _to_utc(reference)
+    start_utc = ref_utc - timedelta(minutes=minutes)
+
+    # Orari in UTC
+    start_iso_utc = start_utc.isoformat()
+    ref_iso_utc = ref_utc.isoformat()
+
+    # Orari in Timezone Locale (es. Europe/Rome) senza tzinfo per matchare stringhe naive
+    ref_local = reference.astimezone(LOCAL_TZ) if reference.tzinfo else reference
+    start_local = ref_local - timedelta(minutes=minutes)
+
+    start_str_naive = start_local.strftime("%Y-%m-%dT%H:%M:%S")
+    end_str_naive = ref_local.strftime("%Y-%m-%dT%H:%M:%S")
+
+    return {
+        "$or": [
+            # 1. Matching per stringhe con offset ISO (es: '2026-07-23T15:25:00+00:00')
+            {FIELD_TIMESTAMP: {"$gte": start_iso_utc, "$lte": ref_iso_utc}},
+
+            # 2. Matching per stringhe naive locali (es: '2026-07-23T17:25:00')
+            {FIELD_TIMESTAMP: {"$gte": start_str_naive, "$lte": end_str_naive}},
+
+            # 3. Matching per veri oggetti Date BSON in Mongo
+            {FIELD_TIMESTAMP: {"$gte": start_utc, "$lte": ref_utc}}
+        ]
+    }
 
 def _compute_generation_params(prompt: str, n_events: int) -> tuple[int, int]:
     #calcolo dinamico dei token
@@ -436,6 +484,8 @@ def _build_summary_prompt(
         ts = e.get(FIELD_TIMESTAMP)
         if isinstance(ts, str):
             ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if ts.tzinfo is not None:
+            ts = ts.astimezone(LOCAL_TZ)
         data_ora = ts.strftime("%d/%m/%Y %H:%M")
         camera_id   = e.get(FIELD_CAMERA)
         location    = e.get(FIELD_LOCATION)
@@ -489,6 +539,8 @@ def _build_custom_prompt(events: list[dict], custom_prompt: str) -> str:
         ts = e.get(FIELD_TIMESTAMP)
         if isinstance(ts, str):
             ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if ts.tzinfo is not None:
+            ts = ts.astimezone(LOCAL_TZ)
         ora = ts.strftime("%H:%M")
         camera_id = e.get(FIELD_CAMERA)
         location = e.get(FIELD_LOCATION)
@@ -740,8 +792,7 @@ async def generate_summary(req: SummaryRequest):
 
 
 
-# ENDPOINT — SINTESI ASINCRONA (per la UI: crea subito la "scheda" e lancia
-# la generazione in background, così l'utente non resta bloccato in attesa)
+# ENDPOINT — SINTESI ASINCRONA
 @app.post("/summaries/richiedi", tags=["Sintesi LLM"])
 async def richiedi_summary(req: SummaryRequest, background_tasks: BackgroundTasks):
     end = req.resolved_end()
@@ -778,17 +829,18 @@ async def richiedi_summary(req: SummaryRequest, background_tasks: BackgroundTask
         if e.get(FIELD_TYPE)
     })
 
-    # documento "scheda" creato subito con stato "in_corso": la UI può già
-    # mostrarlo e interrogarlo mentre l'LLM lavora in background
+    start_local = req.start if req.start.tzinfo else req.start.replace(tzinfo=LOCAL_TZ)
+    end_local = end if end.tzinfo else end.replace(tzinfo=LOCAL_TZ)
+
     documento = {
         "request_date": datetime.now(LOCAL_TZ),
         "camera_ids": req.camera_ids,
         "numero_eventi": len(events),
         "tipi_eventi": event_types,
-        "data_inizio": req.start.date().isoformat(),
-        "data_fine": end.date().isoformat(),
-        "ora_inizio": req.start.time().isoformat(timespec="seconds"),
-        "ora_fine": end.time().isoformat(timespec="seconds"),
+        "data_inizio": start_local.date().isoformat(),
+        "data_fine": end_local.date().isoformat(),
+        "ora_inizio": start_local.time().isoformat(timespec="seconds"),
+        "ora_fine": end_local.time().isoformat(timespec="seconds"),
         "LLM": None,
         "risposta": None,
         "stato": "in_corso",
@@ -839,16 +891,12 @@ async def get_summary_scheda(scheda_id: str, tipo: str = "standard"):
         raise HTTPException(status_code=404, detail="Scheda non trovata")
 
     doc["_id"] = str(doc["_id"])
-    # le schede create prima di questa funzionalità non hanno "stato": sono
-    # per forza già completate, quindi lo deduciamo dalla presenza della risposta
     doc.setdefault("stato", "completato" if doc.get("risposta") else "in_corso")
     return doc
 
 
 @app.post("/summaries/{scheda_id}/nascondi", tags=["Sintesi LLM"])
 async def nascondi_summary_scheda(scheda_id: str, tipo: str = "standard"):
-    # Nasconde la scheda solo dalla schermata principale (Dashboard): il record
-    # resta intatto e continua ad essere consultabile nello Storico risposte.
     try:
         oid = ObjectId(scheda_id)
     except Exception:
@@ -870,15 +918,18 @@ async def salva_risposta_analisi(
     llm_backend,
     event_types
 ):
+    start_local = req.start if req.start.tzinfo else req.start.replace(tzinfo=LOCAL_TZ)
+    end_local = end if end.tzinfo else end.replace(tzinfo=LOCAL_TZ)
+
     documento = {
         "request_date": datetime.now(LOCAL_TZ),
         "camera_ids": req.camera_ids,
         "numero_eventi": total_events,
         "tipi_eventi": event_types,
-        "data_inizio": req.start.date().isoformat(),
-        "data_fine": end.date().isoformat(),
-        "ora_inizio": req.start.time().isoformat(timespec="seconds"),
-        "ora_fine": end.time().isoformat(timespec="seconds"),
+        "data_inizio": start_local.date().isoformat(),
+        "data_fine": end_local.date().isoformat(),
+        "ora_inizio": start_local.time().isoformat(timespec="seconds"),
+        "ora_fine": end_local.time().isoformat(timespec="seconds"),
         "LLM": llm_backend,
         "risposta": risposta,
     }
@@ -894,32 +945,29 @@ async def salva_risposta_prompt(
     llm_backend,
     event_types
 ):
+    start_local = req.start if req.start.tzinfo else req.start.replace(tzinfo=LOCAL_TZ)
+    end_local = end if end.tzinfo else end.replace(tzinfo=LOCAL_TZ)
+
     documento = {
         "request_date": datetime.now(LOCAL_TZ),
         "camera_ids": req.camera_ids,
         "numero_eventi": total_events,
         "tipi_eventi": event_types,
-        "data_inizio": req.start.date().isoformat(),
-        "data_fine": end.date().isoformat(),
-        "ora_inizio": req.start.time().isoformat(timespec="seconds"),
-        "ora_fine": end.time().isoformat(timespec="seconds"),
+        "data_inizio": start_local.date().isoformat(),
+        "data_fine": end_local.date().isoformat(),
+        "ora_inizio": start_local.time().isoformat(timespec="seconds"),
+        "ora_fine": end_local.time().isoformat(timespec="seconds"),
         "prompt": req.custom_prompt,
         "LLM": llm_backend,
         "risposta": risposta,
     }
-
     await prompt_collection.insert_one(documento)
 
 #recupero risposte passate
 @app.get("/analysis_history")
 async def analysis_history():
-
     risultati = []
-
-    cursor = analysis_collection.find().sort(
-        "request_date",
-        -1
-    )
+    cursor = analysis_collection.find().sort("request_date", -1)
 
     async for doc in cursor:
         doc["_id"] = str(doc["_id"])
@@ -931,13 +979,8 @@ async def analysis_history():
 
 @app.get("/prompt_history")
 async def prompt_history():
-
     risultati = []
-
-    cursor = prompt_collection.find().sort(
-        "request_date",
-        -1
-    )
+    cursor = prompt_collection.find().sort("request_date", -1)
 
     async for doc in cursor:
         doc["_id"] = str(doc["_id"])
@@ -956,9 +999,7 @@ async def delete_analysis(analysis_id: str):
     except Exception:
         raise HTTPException(status_code=400, detail="ID non valido")
 
-    result = await analysis_collection.delete_one(
-        {"_id": oid}
-    )
+    result = await analysis_collection.delete_one({"_id": oid})
 
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Analisi non trovata")
@@ -973,9 +1014,7 @@ async def delete_prompt(prompt_id: str):
     except Exception:
         raise HTTPException(status_code=400, detail="ID non valido")
 
-    result = await prompt_collection.delete_one(
-        {"_id": oid}
-    )
+    result = await prompt_collection.delete_one({"_id": oid})
 
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Prompt non trovato")
@@ -983,36 +1022,24 @@ async def delete_prompt(prompt_id: str):
     return {"status": "deleted"}
 
 
-# ENDPOINT — ANALISI AUTOMATICA (job periodico gestito dal worker APScheduler)
-# NOTA: camera_ids, tipi_evento, custom_prompt, start/end, max_events e
-# interval_minutes sono FISSI alla creazione del job e non sono più modificabili.
-# L'unica azione consentita dopo la creazione è /reinclude, che rimuove un
-# evento dalla lista degli esclusi.
-
+# ENDPOINT — AUTOMAZIONE
 @app.post("/automation_jobs", status_code=201, tags=["Automazione"])
 async def create_automation_job(req: AutomationJobCreate):
     now = datetime.now(LOCAL_TZ)
     documento = {
+        "titolo": req.titolo.strip(),
         "camera_ids": req.camera_ids,
         "tipi_evento": req.tipi_evento,
-        "custom_prompt": req.custom_prompt,
-        "titolo": req.titolo,
-        "max_events": req.max_events,
         "interval_minutes": req.interval_minutes,
-        "start": req.start,
-        "end": req.resolved_end(),
+        "custom_prompt": req.custom_prompt.strip() if req.custom_prompt else None,
         "enabled": True,
-        "id_eventi_analizzati": [],
-        "id_eventi_esclusi": req.excluded_ids,
-        "risposta": "",
-        "modello_LLM": None,
+        "analisi": [],
         "ultima_esecuzione": None,
         "ultima_modifica": now,
         "creato_il": now,
     }
     result = await scheduler_collection.insert_one(documento)
     return {"status": "created", "id": str(result.inserted_id)}
-
 
 @app.get("/automation_jobs", tags=["Automazione"])
 async def list_automation_jobs():
@@ -1050,7 +1077,6 @@ async def delete_automation_job(job_id: str):
         raise HTTPException(status_code=404, detail="Job non trovato")
     return {"status": "deleted"}
 
-
 @app.post("/automation_jobs/{job_id}/pause", tags=["Automazione"])
 async def pause_automation_job(job_id: str):
     try:
@@ -1065,7 +1091,6 @@ async def pause_automation_job(job_id: str):
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Job non trovato")
     return {"status": "paused"}
-
 
 @app.post("/automation_jobs/{job_id}/resume", tags=["Automazione"])
 async def resume_automation_job(job_id: str):
@@ -1083,27 +1108,7 @@ async def resume_automation_job(job_id: str):
     return {"status": "resumed"}
 
 
-@app.post("/automation_jobs/{job_id}/reinclude/{event_id}", tags=["Automazione"])
-async def reinclude_event(job_id: str, event_id: str):
-    try:
-        oid = ObjectId(job_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID job non valido")
-
-    result = await scheduler_collection.update_one(
-        {"_id": oid},
-        {
-            "$pull": {"id_eventi_esclusi": event_id},
-            "$set": {"ultima_modifica": datetime.now(LOCAL_TZ)},
-        }
-    )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Job non trovato")
-    return {"status": "reincluded", "event_id": event_id}
-
 @app.get("/analysis_status", tags=["Sintesi LLM"])
 async def get_analysis_status():
-    # Recupera le ultime analisi per mostrare la finestrina/badge
     cursor = analysis_collection.find().sort("request_date", -1).limit(10)
-    # Oppure includi anche le risposte dei prompt
     return [doc_to_event(doc) async for doc in cursor]
