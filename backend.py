@@ -1,15 +1,17 @@
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-from datetime import datetime, timedelta, time, timezone
+from datetime import datetime, timedelta, time, timezone, date
 from zoneinfo import ZoneInfo
 from typing import Optional
 from contextlib import asynccontextmanager
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
+import asyncio
 import httpx
 import os
 import re
+import json
 import yaml
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, APIConnectionError, APIStatusError, APITimeoutError
@@ -22,6 +24,7 @@ MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "eventi_osservati")
 MONGO_ANALYSIS_COLLECTION = os.getenv("MONGO_ANALYSIS_COLLECTION","risposte_analisi")
 MONGO_PROMPT_COLLECTION = os.getenv("MONGO_PROMPT_COLLECTION","risposte_prompt")
 MONGO_SCHEDULER_COLLECTION = os.getenv("MONGO_SCHEDULER_COLLECTION", "risposte_job_periodico")
+MONGO_CRITICAL_COLLECTION = os.getenv("MONGO_CRITICAL_COLLECTION", "eventi_critici_cache")
 
 
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
@@ -112,12 +115,13 @@ PROMPT_SUMMARY_INTRO = LLM_PROMPTS.get(
     "Sei un sistema di analisi della sicurezza."
 ).format(domain_description=LLM_DOMAIN_DESCRIPTION)
 
-mongo_client = AsyncIOMotorClient(MONGO_DETAILS)
+mongo_client = AsyncIOMotorClient(MONGO_DETAILS, tz_aware=True)
 database     = mongo_client[MONGO_DB_NAME]
 collection   = database.get_collection(MONGO_COLLECTION_NAME)
 analysis_collection = database.get_collection(MONGO_ANALYSIS_COLLECTION)
 prompt_collection = database.get_collection(MONGO_PROMPT_COLLECTION)
 scheduler_collection = database.get_collection(MONGO_SCHEDULER_COLLECTION)
+critical_collection = database.get_collection(MONGO_CRITICAL_COLLECTION)
 
 # LIFECYCLE
 @asynccontextmanager
@@ -139,6 +143,29 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+def _find_time_window(t) -> Optional[dict]:
+    """Trova la fascia oraria (da TIME_WINDOWS) in cui cade l'orario `t` (datetime.time).
+    Calcolato deterministicamente in Python invece di lasciarlo indovinare all'LLM,
+    che su modelli piccoli tende a sbagliare il confronto numerico tra orari,
+    specialmente su fasce che attraversano la mezzanotte (es. 22:00–06:00)."""
+    for tw in TIME_WINDOWS:
+        start = time.fromisoformat(tw["start"])
+        end = time.fromisoformat(tw["end"])
+        if start <= end:
+            if start <= t < end:
+                return tw
+        else:
+            # Fascia che attraversa la mezzanotte (es. 22:00-06:00)
+            if t >= start or t < end:
+                return tw
+    return None
+
+
+_RESTRICTED_CAMERA_IDS = {
+    r.get("camera_id") for r in SECURITY_RULES.get("restricted_cameras", [])
+}
+
 
 def _build_contesto_struttura() -> str:
     mappa_telecamere_txt = "\n".join(f"  - {k}: {v}" for k, v in CAMERAS_REGISTRY.items())
@@ -350,6 +377,249 @@ def _build_last_Nminutes_query(reference: datetime, minutes: int) -> dict:
         ]
     }
 
+def _local_midnight(reference: datetime) -> datetime:
+    """Restituisce la mezzanotte (00:00:00) locale del giorno di 'reference'."""
+    ref_local = reference.astimezone(LOCAL_TZ) if reference.tzinfo else reference.replace(tzinfo=LOCAL_TZ)
+    return ref_local.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+async def count_events_until(reference: datetime) -> int:
+    """
+    Dato un datetime, restituisce il numero di eventi avvenuti in quella
+    giornata (dalla mezzanotte locale) fino a quell'ora e minuto compresi.
+    """
+    inizio_giorno = _local_midnight(reference)
+    ref = reference if reference.tzinfo else reference.replace(tzinfo=LOCAL_TZ)
+    query = _build_time_query(inizio_giorno, ref)
+    return await collection.count_documents(query)
+
+
+async def get_daily_counts(reference: Optional[datetime] = None) -> dict:
+    """Numero di eventi di oggi (dalla mezzanotte a 'reference')."""
+    now = reference.astimezone(LOCAL_TZ) if reference else datetime.now(LOCAL_TZ)
+    eventi_oggi = await count_events_until(now)
+
+    return {
+        "riferimento": now.isoformat(),
+        "eventi_oggi": eventi_oggi,
+    }
+
+#prompt che indidua solo eventi critici e li restiuisce con JSON
+# prompt che individua solo eventi critici richiedendo una decisione esplicita (critico: true/false)
+def _build_critical_events_prompt(events: list[dict]) -> str:
+    righe = []
+    for e in events:
+        tags = get_nested_field(e, FIELD_TAGS, [])
+        soggetto = "dipendente" if EMPLOYEE_TAG in tags else "visitatore/cliente (non dipendente)"
+        ts = e.get(FIELD_TIMESTAMP)
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if ts.tzinfo is not None:
+            ts = ts.astimezone(LOCAL_TZ)
+        data_ora = ts.strftime("%d/%m/%Y %H:%M")
+
+        fascia = _find_time_window(ts.time())
+        fascia_label = fascia["label"] if fascia else "Sconosciuta"
+
+        camera_id = e.get(FIELD_CAMERA)
+        zona = "RISERVATA" if camera_id in _RESTRICTED_CAMERA_IDS else "pubblica/standard"
+
+        righe.append(
+            f'- id:"{e.get("_id")}" | [{data_ora}] {camera_id} ({e.get(FIELD_LOCATION)}) '
+            f'| {e.get(FIELD_DESCRIPTION)} | tipo:{e.get(FIELD_TYPE)} | soggetto:{soggetto} '
+            f'| fascia_oraria:{fascia_label} | zona:{zona}'
+        )
+    eventi_txt = "\n".join(righe)
+    n = len(events)
+
+    return f"""{PROMPT_SUMMARY_INTRO}
+{CONTESTO_STRUTTURA}
+
+COMPITO:
+Analizza i seguenti {n} eventi uno per uno.
+Per ogni evento sono già indicati "fascia_oraria" e "zona": NON ricalcolare tu l'orario, usa
+direttamente questi due valori e confrontali con le note delle FASCE ORARIE e con i CRITERI DI
+SICUREZZA definiti sopra nel CONTESTO DELLA STRUTTURA per decidere se l'evento è critico.
+Per OGNI evento inserito nella lista, esprimi un giudizio esplicito indicando se è CRITICO oppure NO.
+Un evento è critico (critico: true) solo se, incrociando fascia_oraria, zona e soggetto,
+viola uno dei criteri sopra descritti.
+Un evento è normale (critico: false) in tutti gli altri casi.
+IMPORTANTE:
+- La sola presenza di un visitatore/cliente (non dipendente) NON è di per sé un motivo di
+  criticità — lo è solo se il CONTESTO DELLA STRUTTURA per quella fascia_oraria/zona lo qualifica
+  esplicitamente come tale (es. orario notturno, zona RISERVATA, fuori orario).
+- Non saltare o riassumere eventi: devi restituire una valutazione per TUTTI e {n} gli eventi elencati,
+  senza eccezioni, anche se molti si assomigliano tra loro.
+
+REGOLE DI RISPOSTA (OBBLIGATORIE):
+ - Rispondi SOLO con un array JSON valido contenente un oggetto per ciascun evento analizzato ({n} oggetti totali). Nessun testo prima o dopo, nessun commento, nessun Markdown.
+ - Ogni elemento dell'array deve avere ESATTAMENTE questi campi:
+   "id" (l'id dell'evento fornito),
+   "critico" (boolean: true se critico, false se normale),
+   "motivo" (spiegazione breve in {LLM_RESPONSE_LANGUAGE} della tua valutazione)
+ - Non inventare id che non sono nella lista fornita.
+
+EVENTI DA ANALIZZARE:
+{eventi_txt}
+
+JSON:"""
+
+
+# Numero massimo di eventi per chiamata LLM: batch più corti riducono il rischio
+# che un modello piccolo "perda" eventi in mezzo a una lista lunga (effetto
+# lost-in-the-middle), a costo di più chiamate quando gli eventi del giorno sono tanti.
+CRITICAL_BATCH_SIZE = int(os.getenv("CRITICAL_BATCH_SIZE", "12"))
+
+
+def _parse_json_array(raw: str) -> list[dict]:
+    if not raw:
+        return []
+    testo = raw.strip()
+    testo = re.sub(r"^```(?:json)?\s*", "", testo)
+    testo = re.sub(r"\s*```$", "", testo)
+    try:
+        parsed = json.loads(testo)
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        pass
+    inizio = testo.find("[")
+    fine = testo.rfind("]")
+    if inizio != -1 and fine != -1 and fine > inizio:
+        try:
+            parsed = json.loads(testo[inizio:fine + 1])
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def _formatta_evento_critico(eid: str, e: dict, motivo: str) -> dict:
+    ts = e.get(FIELD_TIMESTAMP)
+    if isinstance(ts, str):
+        ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    if isinstance(ts, datetime) and ts.tzinfo is not None:
+        ts = ts.astimezone(LOCAL_TZ)
+    data_ora_str = ts.strftime("%d/%m/%Y %H:%M") if isinstance(ts, datetime) else str(ts)
+
+    return {
+        "id": eid,
+        "timestamp": data_ora_str,
+        "camera_id": e.get(FIELD_CAMERA),
+        "location": e.get(FIELD_LOCATION),
+        "description": e.get(FIELD_DESCRIPTION),
+        "motivo": motivo,
+    }
+
+
+async def _analizza_batch_critico(events: list[dict]) -> list[dict]:
+    prompt = _build_critical_events_prompt(events)
+    raw = await call_llm(prompt, n_events=len(events))
+    valutazioni = _parse_json_array(raw)
+
+    events_by_id = {str(e.get("_id")): e for e in events}
+    eventi_critici = []
+    for item in valutazioni:
+        eid = str(item.get("id", ""))
+        if eid in events_by_id and item.get("critico") is True:
+            eventi_critici.append(
+                _formatta_evento_critico(eid, events_by_id[eid], item.get("motivo", "Nessuna motivazione fornita"))
+            )
+    return eventi_critici
+
+
+# Chiede al provider di individuare gli eventi critici, elaborando a blocchi per
+# ridurre il rischio che eventi vengano "persi" su liste lunghe.
+async def analizza_eventi_critici(events: list[dict]) -> list[dict]:
+    if not events:
+        return []
+
+    eventi_critici: list[dict] = []
+    for i in range(0, len(events), CRITICAL_BATCH_SIZE):
+        batch = events[i:i + CRITICAL_BATCH_SIZE]
+        eventi_critici.extend(await _analizza_batch_critico(batch))
+
+    return eventi_critici
+
+
+_critical_recompute_lock = asyncio.Lock()
+
+
+async def recompute_critical_cache() -> dict:
+    """Ricalcola e salva in cache gli eventi critici della giornata odierna.
+
+    Valutazione INCREMENTALE: rispetto alla cache già salvata per oggi, chiediamo
+    all'LLM di classificare solo gli eventi NON ancora valutati, non l'intera
+    giornata da capo. Questo tiene bassa la latenza (importante man mano che gli
+    eventi di oggi si accumulano) ed evita di rifare lavoro identico ad ogni
+    trigger del watcher.
+
+    Il lock evita che due ricalcoli sovrapposti (es. uno partito dal worker e uno
+    lanciato a mano da /docs mentre il primo è ancora in corso) possano finire in
+    ordine invertito e sovrascriversi a vicenda, lasciando in cache un risultato
+    più vecchio di quello reale.
+    """
+    async with _critical_recompute_lock:
+        oggi = datetime.now(LOCAL_TZ).date()
+        oggi_iso = oggi.isoformat()
+        inizio_giorno = datetime.combine(oggi, time(0, 0, 0), tzinfo=LOCAL_TZ)
+        riferimento = datetime.now(LOCAL_TZ)
+
+        query = _build_time_query(inizio_giorno, riferimento)
+        cursor = collection.find(query).sort(FIELD_TIMESTAMP, 1)
+        events = [doc_to_event(doc) async for doc in cursor]
+
+        cache_esistente = await critical_collection.find_one({"data": oggi_iso})
+        # Se la cache esistente non è di oggi (giorno cambiato) la ignoriamo.
+        if cache_esistente and cache_esistente.get("data") == oggi_iso:
+            id_gia_valutati = set(cache_esistente.get("id_eventi_valutati", []))
+            eventi_critici_precedenti = cache_esistente.get("eventi_critici", [])
+        else:
+            id_gia_valutati = set()
+            eventi_critici_precedenti = []
+
+        eventi_nuovi = [e for e in events if e.get("_id") not in id_gia_valutati]
+
+        critici_nuovi = await analizza_eventi_critici(eventi_nuovi) if eventi_nuovi else []
+
+        eventi_critici = eventi_critici_precedenti + critici_nuovi
+        # Le date sono tutte di oggi ("dd/mm/yyyy HH:MM"): ordinamento lessicografico
+        # coincide con quello cronologico.
+        eventi_critici.sort(key=lambda ev: ev.get("timestamp", ""))
+
+        id_valutati_aggiornati = list(id_gia_valutati | {e.get("_id") for e in eventi_nuovi})
+
+        llm_label = (
+            f"OpenAI ({OPENAI_MODEL})" if LLM_PROVIDER == "openai" else f"Ollama ({OLLAMA_MODEL})"
+        )
+
+        documento = {
+            "data": oggi_iso,
+            "aggiornato_il": datetime.now(LOCAL_TZ),
+            "riferimento": riferimento,
+            "numero_eventi_totali": len(events),
+            "numero_critici": len(eventi_critici),
+            "eventi_critici": eventi_critici,
+            "id_eventi_valutati": id_valutati_aggiornati,
+            "LLM": llm_label,
+        }
+
+        await critical_collection.update_one(
+            {"data": oggi_iso},
+            {"$set": documento},
+            upsert=True,
+        )
+        return documento
+
+
+async def get_critical_cache() -> Optional[dict]:
+    """Restituisce la cache degli eventi critici odierni, se già calcolata."""
+    oggi = datetime.now(LOCAL_TZ).date()
+    doc = await critical_collection.find_one({"data": oggi.isoformat()})
+    if doc:
+        doc["_id"] = str(doc["_id"])
+    return doc
+
+
 def _compute_generation_params(prompt: str, n_events: int) -> tuple[int, int]:
     #calcolo dinamico dei token
     output_tokens = max(LLM_MIN_OUTPUT_TOKENS, n_events * LLM_TOKENS_PER_EVENT + 1024)
@@ -383,12 +653,18 @@ async def _call_ollama(prompt: str, n_events: int) -> str:
             response.raise_for_status()
             data = response.json()
             return data.get("response", "[Ollama: risposta vuota]")
-    except httpx.ConnectError:
-        return f"[Errore Ollama] Impossibile connettersi a {OLLAMA_BASE_URL}."
-    except httpx.TimeoutException:
-        return f"[Errore Ollama] Timeout '{OLLAMA_MODEL}'."
+    except httpx.ConnectError as e:
+        raise RuntimeError(f"Impossibile connettersi a Ollama ({OLLAMA_BASE_URL}).") from e
+    except httpx.TimeoutException as e:
+        raise RuntimeError(f"Timeout chiamando il modello Ollama '{OLLAMA_MODEL}'.") from e
+    except httpx.HTTPStatusError as e:
+        # Include qui il caso più comune al primo avvio: modello non ancora scaricato.
+        raise RuntimeError(
+            f"Ollama ha risposto con errore ({e.response.status_code}) per il modello "
+            f"'{OLLAMA_MODEL}': potrebbe non essere ancora stato scaricato."
+        ) from e
     except Exception as e:
-        return f"[Errore Ollama] {type(e).__name__}: {e}"
+        raise RuntimeError(f"Errore Ollama imprevisto: {type(e).__name__}: {e}") from e
 
 
 async def _call_openai(prompt: str, n_events: int) -> str:
@@ -406,14 +682,14 @@ async def _call_openai(prompt: str, n_events: int) -> str:
         )
         content = response.choices[0].message.content
         return content if content else "[OpenAI: risposta vuota]"
-    except APIConnectionError:
-        return "[Errore OpenAI] Impossibile connettersi all'API OpenAI."
-    except APITimeoutError:
-        return f"[Errore OpenAI] Timeout '{OPENAI_MODEL}'."
+    except APIConnectionError as e:
+        raise RuntimeError("Impossibile connettersi all'API OpenAI.") from e
+    except APITimeoutError as e:
+        raise RuntimeError(f"Timeout chiamando il modello OpenAI '{OPENAI_MODEL}'.") from e
     except APIStatusError as e:
-        return f"[Errore OpenAI] {e.status_code}: {e.message}"
+        raise RuntimeError(f"OpenAI ha risposto con errore {e.status_code}: {e.message}") from e
     except Exception as e:
-        return f"[Errore OpenAI] {type(e).__name__}: {e}"
+        raise RuntimeError(f"Errore OpenAI imprevisto: {type(e).__name__}: {e}") from e
 
 #dispatch tra Ollama locale e OpenAI cloud, in base a LLM_PROVIDER
 async def call_llm(prompt: str, n_events: int = 0) -> str:
@@ -480,7 +756,7 @@ def _build_summary_prompt(
     righe = []
     for e in events:
         tags = get_nested_field(e, FIELD_TAGS, [])
-        soggetto = "dipendente autorizzato" if EMPLOYEE_TAG in tags else "persona esterna non autorizzata"
+        soggetto = "dipendente" if EMPLOYEE_TAG in tags else "visitatore/cliente (non dipendente)"
         ts = e.get(FIELD_TIMESTAMP)
         if isinstance(ts, str):
             ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
@@ -491,18 +767,14 @@ def _build_summary_prompt(
         location    = e.get(FIELD_LOCATION)
         description = e.get(FIELD_DESCRIPTION)
         righe.append(
-            f"[{data_ora}] {camera_id} ({location}) | {description} | soggetto:{soggetto}"
+            f'- id:"{e.get("_id")}" | [{data_ora}] {camera_id} ({location}) | {description} | soggetto:{soggetto}'
         )
     eventi_txt = "\n".join(righe)
     n = len(events)
 
+    nomi_categorie = [c["name"] for c in LLM_CATEGORIES]
     guida_categorie_txt = "\n".join(
         f"  {c['name']:<24}→ {c['guida']}" for c in LLM_CATEGORIES
-    )
-    struttura_sezioni_txt = "\n\n".join(
-        f"### {c['name']}\n"
-        f"- [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <{c['esempio_motivo']}>"
-        for c in LLM_CATEGORIES
     )
 
     return f"""{PROMPT_SUMMARY_INTRO}
@@ -511,31 +783,83 @@ def _build_summary_prompt(
 GUIDA ALLE CATEGORIE (usala per assegnare ogni evento):
 {guida_categorie_txt}
 
-REGOLE DI RISPOSTA:
- - HAI RICEVUTO ESATTAMENTE {n} EVENTI. DEVI CLASSIFICARNE ESATTAMENTE {n}. TRALASCIARE UN EVENTO è UN GRAVE ERRORE.
- - OGNI EVENTO COMPARE UNA SOLA VOLTA nella risposta. Duplicare un evento è un errore CRITICO.
- - Assegna ogni evento alla sezione più appropriata in base a orario, zona e soggetto.
- - NON RISCRIVERE la lista di eventi in blocco.
- - Formato OBBLIGATORIO di ogni riga classificata:
-   [GG/MM/AAAA HH:MM] <camera> (<location>) | <descrizione> | Motivo: <la tua spiegazione>
- - Non aggiungere il tipo di soggetto nelle righe di output.
- - Se una sezione non ha eventi, OMETTILA completamente.
-
-HAI QUESTI EVENTI DA CLASSIFICARE :
+HAI RICEVUTO ESATTAMENTE {n} EVENTI, ognuno con un "id" univoco:
 {eventi_txt}
 
-Rispondi in {LLM_RESPONSE_LANGUAGE} con questa ESATTA struttura.
-{struttura_sezioni_txt}
+COMPITO: per OGNI id qui sopra, assegna ESATTAMENTE UNA categoria tra: {", ".join(nomi_categorie)}.
+Scrivi anche un breve motivo (in {LLM_RESPONSE_LANGUAGE}) per la classificazione.
 
-Riepilogo:
-"""
+REGOLE DI RISPOSTA (OBBLIGATORIE):
+ - Rispondi SOLO con un array JSON valido, nessun testo prima o dopo, nessun commento, nessun Markdown.
+ - L'array deve contenere ESATTAMENTE {n} elementi, uno per ciascun id ricevuto, ognuno una sola volta.
+ - Ogni elemento deve avere ESATTAMENTE questi campi: "id" (uguale a uno di quelli forniti sopra), "categoria" (una delle categorie elencate, testo identico), "motivo" (spiegazione breve).
+ - Non inventare id che non sono nella lista fornita.
+
+JSON:"""
+
+
+def _render_summary_sections(events: list[dict], classificazione: list[dict]) -> str:
+    """
+    Assembla il testo finale a sezioni (### Categoria) a partire dagli eventi
+    originali e dalla classificazione id->categoria restituita dall'LLM.
+    L'assemblaggio è fatto qui, in modo deterministico: ogni evento viene
+    inserito al massimo una volta, indipendentemente da eventuali id
+    duplicati o ripetuti nella risposta del modello.
+    """
+    eventi_by_id = {str(e.get("_id")): e for e in events}
+    nomi_categorie = [c["name"] for c in LLM_CATEGORIES]
+
+    # id -> (categoria, motivo); la prima assegnazione valida per ogni id vince,
+    # eventuali duplicati restituiti dal modello vengono scartati qui.
+    assegnazione: dict[str, tuple[str, str]] = {}
+    for item in classificazione:
+        eid = str(item.get("id", ""))
+        categoria = item.get("categoria")
+        if eid in eventi_by_id and eid not in assegnazione and categoria in nomi_categorie:
+            assegnazione[eid] = (categoria, item.get("motivo", ""))
+
+    def _riga(e: dict, motivo: str) -> str:
+        ts = e.get(FIELD_TIMESTAMP)
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if ts.tzinfo is not None:
+            ts = ts.astimezone(LOCAL_TZ)
+        data_ora = ts.strftime("%d/%m/%Y %H:%M")
+        riga = f"- [{data_ora}] {e.get(FIELD_CAMERA)} ({e.get(FIELD_LOCATION)}) | {e.get(FIELD_DESCRIPTION)}"
+        if motivo:
+            riga += f" | Motivo: {motivo}"
+        return riga
+
+    sezioni: dict[str, list[str]] = {nome: [] for nome in nomi_categorie}
+    non_classificati = []
+
+    for e in events:
+        eid = str(e.get("_id"))
+        if eid in assegnazione:
+            categoria, motivo = assegnazione[eid]
+            sezioni[categoria].append(_riga(e, motivo))
+        else:
+            # Il modello non ha classificato questo evento (o l'ha assegnato
+            # a una categoria inesistente): lo segnaliamo comunque, non lo
+            # perdiamo silenziosamente.
+            non_classificati.append(_riga(e, ""))
+
+    blocchi = []
+    for nome in nomi_categorie:
+        if sezioni[nome]:
+            blocchi.append(f"### {nome}\n" + "\n".join(sezioni[nome]))
+
+    if non_classificati:
+        blocchi.append("### Non classificato dal modello\n" + "\n".join(non_classificati))
+
+    return "\n\n".join(blocchi) if blocchi else "Nessun evento da segnalare."
 
 #metodo per costruire il prompt per una richiesta personalizata
 def _build_custom_prompt(events: list[dict], custom_prompt: str) -> str:
     righe_lista = []
     for e in events:
         tags = get_nested_field(e, FIELD_TAGS, [])
-        soggetto = "dipendente autorizzato" if EMPLOYEE_TAG in tags else "persona non autorizzata"
+        soggetto = "dipendente" if EMPLOYEE_TAG in tags else "visitatore/cliente (non dipendente)"
         ts = e.get(FIELD_TIMESTAMP)
         if isinstance(ts, str):
             ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
@@ -562,15 +886,21 @@ def _build_custom_prompt(events: list[dict], custom_prompt: str) -> str:
         f"LISTA DEGLI EVENTI DA ANALIZZARE ({len(events)} totali):\n{righe_eventi}\n\n"
     )
 
-#dispatcher per i due tipi di richieste all'LLM
-def build_llm_prompt(
+#dispatcher per i due tipi di richieste all'LLM: sintesi "standard" a sezioni
+#(classificazione JSON + rendering deterministico in Python, per evitare
+#eventi duplicati o omessi) oppure risposta libera a un prompt personalizzato.
+async def genera_sintesi(
     events: list[dict],
     custom_prompt: Optional[str] = None,
 ) -> str:
-
     if custom_prompt and custom_prompt.strip():
-        return _build_custom_prompt(events, custom_prompt.strip())
-    return _build_summary_prompt(events)
+        prompt = _build_custom_prompt(events, custom_prompt.strip())
+        return await call_llm(prompt, n_events=len(events))
+
+    prompt = _build_summary_prompt(events)
+    raw = await call_llm(prompt, n_events=len(events))
+    classificazione = _parse_json_array(raw)
+    return _render_summary_sections(events, classificazione)
 
 
 
@@ -719,6 +1049,43 @@ async def get_stats(
     }
 
 
+# ENDPOINT — CONTATORI GIORNALIERI (per le box in alto della dashboard)
+@app.get("/stats/daily_counts", tags=["Statistiche"])
+async def daily_counts():
+    """Numero di eventi di oggi (dalla mezzanotte a ora:minuto correnti)
+    confrontato con lo stesso intervallo del giorno precedente."""
+    return await get_daily_counts()
+
+
+# ENDPOINT — EVENTI CRITICI (individuati dall'LLM_PROVIDER configurato)
+@app.get("/stats/critical_events", tags=["Statistiche"])
+async def critical_events():
+    """
+    Restituisce, dalla cache calcolata in background dal worker (o dall'ultimo
+    ricalcolo manuale), il numero e la lista degli eventi critici individuati
+    dall'LLM per la giornata odierna (dalla mezzanotte a ora).
+    """
+    oggi = datetime.now(LOCAL_TZ).date()
+    doc = await get_critical_cache()
+    if doc is None:
+        return {
+            "data": oggi.isoformat(),
+            "calcolato": False,
+            "numero_critici": 0,
+            "numero_eventi_totali": 0,
+            "eventi_critici": [],
+        }
+
+    doc["calcolato"] = True
+    doc.pop("id_eventi_valutati", None)
+    return doc
+
+
+@app.post("/stats/critical_events/recompute", tags=["Statistiche"])
+async def critical_events_recompute():
+    return await recompute_critical_cache()
+
+
 # ENDPOINT — SINTESI
 @app.post("/summaries", tags=["Sintesi LLM"])
 async def generate_summary(req: SummaryRequest):
@@ -746,8 +1113,7 @@ async def generate_summary(req: SummaryRequest):
                 "Controlla che il simulatore abbia inviato eventi in questo intervallo."
             ),
         )
-    prompt = build_llm_prompt(events, req.custom_prompt)
-    sintesi = await call_llm(prompt, n_events=len(events))
+    sintesi = await genera_sintesi(events, req.custom_prompt)
 
     llm_backend_label = (
         f"OpenAI ({OPENAI_MODEL})"
@@ -861,15 +1227,19 @@ async def richiedi_summary(req: SummaryRequest, background_tasks: BackgroundTask
 async def _esegui_analisi_in_background(scheda_id: str, is_prompt: bool, events, req, end):
     target_collection = prompt_collection if is_prompt else analysis_collection
     try:
-        prompt = build_llm_prompt(events, req.custom_prompt)
-        sintesi = await call_llm(prompt, n_events=len(events))
+        sintesi = await genera_sintesi(events, req.custom_prompt)
         llm_backend_label = (
             f"OpenAI ({OPENAI_MODEL})" if LLM_PROVIDER == "openai"
             else f"Ollama ({OLLAMA_MODEL})"
         )
         await target_collection.update_one(
             {"_id": ObjectId(scheda_id)},
-            {"$set": {"risposta": sintesi, "LLM": llm_backend_label, "stato": "completato"}}
+            {"$set": {
+                "risposta": sintesi,
+                "LLM": llm_backend_label,
+                "stato": "completato",
+                "completato_il": datetime.now(LOCAL_TZ),
+            }}
         )
     except Exception as ex:
         await target_collection.update_one(
@@ -921,8 +1291,9 @@ async def salva_risposta_analisi(
     start_local = req.start if req.start.tzinfo else req.start.replace(tzinfo=LOCAL_TZ)
     end_local = end if end.tzinfo else end.replace(tzinfo=LOCAL_TZ)
 
+    now = datetime.now(LOCAL_TZ)
     documento = {
-        "request_date": datetime.now(LOCAL_TZ),
+        "request_date": now,
         "camera_ids": req.camera_ids,
         "numero_eventi": total_events,
         "tipi_eventi": event_types,
@@ -932,6 +1303,8 @@ async def salva_risposta_analisi(
         "ora_fine": end_local.time().isoformat(timespec="seconds"),
         "LLM": llm_backend,
         "risposta": risposta,
+        "stato": "completato",
+        "completato_il": now,
     }
 
     await analysis_collection.insert_one(documento)
@@ -948,8 +1321,9 @@ async def salva_risposta_prompt(
     start_local = req.start if req.start.tzinfo else req.start.replace(tzinfo=LOCAL_TZ)
     end_local = end if end.tzinfo else end.replace(tzinfo=LOCAL_TZ)
 
+    now = datetime.now(LOCAL_TZ)
     documento = {
-        "request_date": datetime.now(LOCAL_TZ),
+        "request_date": now,
         "camera_ids": req.camera_ids,
         "numero_eventi": total_events,
         "tipi_eventi": event_types,
@@ -960,6 +1334,8 @@ async def salva_risposta_prompt(
         "prompt": req.custom_prompt,
         "LLM": llm_backend,
         "risposta": risposta,
+        "stato": "completato",
+        "completato_il": now,
     }
     await prompt_collection.insert_one(documento)
 
@@ -972,6 +1348,8 @@ async def analysis_history():
     async for doc in cursor:
         doc["_id"] = str(doc["_id"])
         doc.setdefault("stato", "completato" if doc.get("risposta") else "in_corso")
+        if doc["stato"] == "completato":
+            doc.setdefault("completato_il", doc.get("request_date"))
         doc.setdefault("nascosta", False)
         risultati.append(doc)
 
@@ -985,6 +1363,8 @@ async def prompt_history():
     async for doc in cursor:
         doc["_id"] = str(doc["_id"])
         doc.setdefault("stato", "completato" if doc.get("risposta") else "in_corso")
+        if doc["stato"] == "completato":
+            doc.setdefault("completato_il", doc.get("request_date"))
         doc.setdefault("nascosta", False)
         risultati.append(doc)
 

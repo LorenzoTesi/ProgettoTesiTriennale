@@ -1,4 +1,3 @@
-
 services:
   # 1. DATABASE MongoDB
   mongodb:
@@ -8,7 +7,6 @@ services:
       - "27017:27017"
     volumes:
       - mongo_data:/data/db
-      - ./mongo-seed:/docker-entrypoint-initdb.d
     networks:
       - rete_sorveglianza
     healthcheck:
@@ -30,8 +28,8 @@ services:
     depends_on:
       mongodb:
         condition: service_healthy
-      ollama:
-        condition: service_started
+      ollama-init:
+        condition: service_completed_successfully
     networks:
       - rete_sorveglianza
 
@@ -73,6 +71,7 @@ services:
       - OLLAMA_HOST=http://ollama:11434
     entrypoint: >
       sh -c "
+        set -e;
         echo 'In attesa che Ollama sia pronto...';
         until ollama list > /dev/null 2>&1; do sleep 2; done;
         echo 'Ollama pronto. Scarico il modello: ' $${OLLAMA_MODEL:-llama3.2};
@@ -93,11 +92,37 @@ services:
     depends_on:
       mongodb:
         condition: service_healthy
-      ollama:
-        condition: service_started
+      ollama-init:
+        condition: service_completed_successfully
+      seeder:
+        condition: service_completed_successfully
     networks:
       - rete_sorveglianza
     restart: unless-stopped
+
+
+  # 7. SEEDER — popola automaticamente l'ultimo mese di eventi simulati
+  # all'avvio (una tantum, salta se la collezione contiene già dati).
+  seeder:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: seeder
+    env_file:
+      - .env
+    environment:
+      - SEED_BACKEND_URL=http://api:8000
+      - SEED_DAYS=30
+      - SEED_FREQ_PER_HOUR=1
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      api:
+        condition: service_started
+    command: ["python", "seed.py"]
+    networks:
+      - rete_sorveglianza
+    restart: "no"
 
 
 networks:

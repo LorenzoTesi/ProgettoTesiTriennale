@@ -42,6 +42,17 @@ div[data-testid="stMetric"] {
     border-radius: 10px;
     padding: 14px 18px;
 }
+div[class*="st-key-critical_box"] {
+    border: 1px solid rgba(220,50,50,0.5);
+    background-color: rgba(220,50,50,0.06);
+    border-radius: 10px;
+    padding: 14px 18px;
+}
+div[class*="st-key-critical_events_scroll"] {
+    border: none !important;
+    background-color: transparent !important;
+    padding-right: 8px !important;
+}
 
 div[data-testid="stColumn"] {
     white-space: normal !important;
@@ -154,43 +165,6 @@ RESTRICTED_CAMERAS = {
     r["camera_id"] for r in DOMAIN_CONFIG.get("security_rules", {}).get("restricted_cameras", [])
 }
 
-
-def classifica_criticita(evento: dict) -> tuple[str, str]:
-    if not DOMAIN_CONFIG:
-        return "N/D", "Configurazione di dominio non disponibile"
-
-    dt_roma = converti_a_roma(evento.get("timestamp", ""))
-    if dt_roma is None:
-        return "N/D", "Timestamp non valido"
-
-    hour = dt_roma.hour
-    tags = evento.get("metadata", {}).get("tags", [])
-    is_employee = EMPLOYEE_TAG in tags
-    cam = evento.get("camera_id")
-
-    if cam in RESTRICTED_CAMERAS and not is_employee:
-        return "Critico", "Presenza non autorizzata nella camera blindata"
-
-    if 19 <= hour < 22:
-        if not is_employee:
-            return "Critico", "Soggetto non riconosciuto come dipendente fuori orario"
-        return "Basso", "Dipendente presente fuori orario"
-
-    if hour >= 22 or hour < 6:
-        if not is_employee:
-            return "Critico", "Presenza notturna non identificata come dipendente"
-        return "Medio", "Dipendente presente in orario notturno"
-
-    if 6 <= hour < 8:
-        if not is_employee:
-            return "Alto", "Soggetto non dipendente durante la pre-apertura"
-        return "Basso", "Dipendente in pre-apertura"
-
-    if "loitering" in tags:
-        return "Medio", "Stazionamento prolungato rilevato"
-    return "Basso", "Comportamento ordinario per orario e zona"
-
-
 # HELPER GENERICI
 def converti_a_roma(dt_input):
     if not dt_input:
@@ -233,6 +207,26 @@ def get_events(params):
     except Exception as e:
         st.error(f"Errore connessione: {e}")
     return None
+
+
+def get_daily_counts():
+    try:
+        r = requests.get(f"{API_BASE_URL}/stats/daily_counts", timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        st.error(f"Errore recupero conteggi giornalieri: {e}")
+        return None
+
+
+def get_critical_events():
+    try:
+        r = requests.get(f"{API_BASE_URL}/stats/critical_events", timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        st.error(f"Errore recupero eventi critici: {e}")
+        return None
 
 
 def generate_summary(payload):
@@ -440,7 +434,7 @@ def render_schede_analisi(storico_analisi, storico_prompt):
         return
 
     st.markdown("")
-    st.markdown("##### 🗂️ Le tue analisi")
+    st.markdown("##### Le tue analisi")
 
     cols = st.columns(len(schede), gap="small")
 
@@ -504,6 +498,76 @@ def render_vista_risposta_analisi():
         st.markdown(scheda.get("risposta") or "_Nessuna risposta disponibile._")
 
 
+@st.fragment(run_every="15s")
+def _kpi_e_critici_fragment():
+    conteggi = get_daily_counts() or {"eventi_oggi": 0}
+    critici_oggi_data = get_critical_events() or {
+        "numero_critici": 0, "eventi_critici": [], "calcolato": False, "aggiornato_il": None,
+    }
+    storico_analisi = get_history("analysis") or []
+    storico_prompt = get_history("prompt") or []
+    analisi_24h = [
+        it for it in (storico_analisi + storico_prompt)
+        if it.get("stato") == "completato" and
+           converti_a_roma(it.get("completato_il") or it.get("request_date", "")) and
+           converti_a_roma(it.get("completato_il") or it["request_date"]) >= datetime.now(FUSO_ROMA) - timedelta(
+            hours=24)
+    ]
+
+    n_camere_attive = sum(1 for v in st.session_state.camera_status.values() if v)
+    n_camere_totali = len(st.session_state.camera_status) or 1
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric(
+            "Eventi di oggi",
+            conteggi.get("eventi_oggi", 0),
+        )
+    with k2:
+        st.metric(
+            "Eventi critici di oggi",
+            critici_oggi_data.get("numero_critici", 0),
+            delta_color="off",
+        )
+    with k3:
+        st.metric("Telecamere attive", f"{n_camere_attive} / {n_camere_totali}")
+    with k4:
+        st.metric("Analisi AI completate", len(analisi_24h))
+
+    st.markdown("")
+    with st.container(key="critical_box"):
+        st.markdown("#### Eventi critici · oggi (analisi LLM)")
+
+        eventi_critici = critici_oggi_data.get("eventi_critici", [])
+        with st.container(height=340, border=False, key="critical_events_scroll"):
+            if not critici_oggi_data.get("calcolato", False):
+                st.caption("⏳ Primo calcolo in corso da parte del worker in background...")
+            elif not eventi_critici:
+                st.caption("Nessun evento critico rilevato oggi.")
+            else:
+                for e in eventi_critici:
+                    # Gestione formattazione timestamp
+                    dt_roma = converti_a_roma(e.get("timestamp", ""))
+                    testo_data = dt_roma.strftime("%d/%m/%Y %H:%M") if dt_roma else e.get("timestamp", "-")
+
+                    desc = e.get('description', '-')
+                    loc = e.get('location')
+                    if loc:
+                        desc_completa = f"{desc} ({loc})"
+                    else:
+                        desc_completa = desc
+
+                    motivo = e.get('motivo', '')
+
+                    # Formattazione: data e ora | descrizione evento | motivazione del LLM
+                    st.markdown(f"**{testo_data}** | {desc_completa} | _{motivo}_")
+                    st.divider()
+
+        aggiornato_il = critici_oggi_data.get("aggiornato_il")
+        if aggiornato_il:
+            dt_agg = converti_a_roma(aggiornato_il)
+            if dt_agg:
+                st.caption(f"Ultimo aggiornamento LLM: {dt_agg.strftime('%d/%m/%Y %H:%M:%S')}")
 # PAGINA: DASHBOARD (HOME)
 def pagina_dashboard():
     st.title("Dashboard")
@@ -523,52 +587,10 @@ def pagina_dashboard():
     if len(tipi_evento_sel) > 1:
         eventi_periodo = [e for e in eventi_periodo if e["event_type"] in tipi_evento_sel]
 
-    now = datetime.now(FUSO_ROMA)
-    params_24h = {"start": (now - timedelta(hours=24)).isoformat(), "end": now.isoformat(), "limit": 0}
-    dati_24h = get_events(params_24h)
-
-    eventi_24h = dati_24h["events"] if dati_24h else []
-    classificati_24h = [(e, *classifica_criticita(e)) for e in eventi_24h]
-    critici_24h = [e for e, liv, _ in classificati_24h if liv == "Critico"]
+    _kpi_e_critici_fragment()
 
     storico_analisi = get_history("analysis") or []
     storico_prompt = get_history("prompt") or []
-    analisi_24h = [
-        it for it in (storico_analisi + storico_prompt)
-        if converti_a_roma(it.get("request_date", "")) and
-           converti_a_roma(it["request_date"]) >= datetime.now(FUSO_ROMA) - timedelta(hours=24)
-    ]
-
-    n_camere_attive = sum(1 for v in st.session_state.camera_status.values() if v)
-    n_camere_totali = len(st.session_state.camera_status) or 1
-
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        st.metric("📅 Eventi ultime 24 ore", len(eventi_24h))
-    with k2:
-        st.metric("⚠️ Eventi critici", len(critici_24h))
-    with k3:
-        st.metric("🎥 Telecamere attive", f"{n_camere_attive} / {n_camere_totali}")
-    with k4:
-        st.metric("🧠 Analisi AI completate", len(analisi_24h))
-
-    st.markdown("")
-    with st.container():
-        st.markdown('<div class="critical-box">', unsafe_allow_html=True)
-        st.markdown("#### 🔴 Eventi critici · ultime 24 ore")
-        if not critici_24h:
-            st.caption("Nessun evento critico rilevato nelle ultime 24 ore.")
-        else:
-            for e in critici_24h[:5]:
-                _, liv, motivo = next(c for c in classificati_24h if c[0] is e)
-                dt_roma = converti_a_roma(e["timestamp"])
-                testo_data = dt_roma.strftime("%d/%m %H:%M") if dt_roma else e["timestamp"]
-                c1, c2, c3 = st.columns([2, 5, 2])
-                c1.markdown(f"**{testo_data}**")
-                c2.markdown(f"**{e['description']}** — {e['location']}  \n_{motivo}_")
-                c3.markdown(f"{BADGE.get(liv, liv)}")
-                st.divider()
-        st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("")
     st.markdown(f"#### Telecamere ")
@@ -906,7 +928,7 @@ def pagina_impostazioni():
 
             st.divider()
 
-            st.markdown("#### 📋 Storico Analisi Eseguite")
+            st.markdown("#### Storico Analisi Eseguite")
             elenco_analisi = job.get("analisi", [])
 
             if not elenco_analisi:
@@ -982,6 +1004,3 @@ elif st.session_state.page == "Storico risposte":
 
 st.divider()
 st.caption("Sistema di archiviazione, rilevazione e sintesi eventi — FastAPI + Streamlit")
-
-
-#TODO SCHERMATA PRINCIPALE JOB PERIODICO EVENTI CRITICI ULTIME 24H E RIPULIRE
