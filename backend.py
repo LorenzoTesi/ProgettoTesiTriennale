@@ -36,8 +36,8 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 CONFIG_PATH = os.getenv("CONFIG_PATH", "config.yaml")
 
 LOCAL_TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Rome"))
-
 VALID_LLM_PROVIDERS = {"ollama", "openai"}
+
 if LLM_PROVIDER not in VALID_LLM_PROVIDERS:
     raise RuntimeError(
         f"LLM_PROVIDER='{LLM_PROVIDER}' non valido. Valori ammessi: {sorted(VALID_LLM_PROVIDERS)}. "
@@ -68,7 +68,8 @@ DOMAIN_CONFIG = load_domain_config(CONFIG_PATH)
 
 ALLOWED_EVENT_TYPES = set(DOMAIN_CONFIG.get("event_types", ["movement", "crowd", "idle"]))
 CAMERAS_REGISTRY = DOMAIN_CONFIG.get("cameras", {})
-EMPLOYEE_TAG = DOMAIN_CONFIG.get("actor_tags", {}).get("employee", "employee")
+TAG_DEFINITIONS = DOMAIN_CONFIG.get("tag_definitions", {})
+DEFAULT_TAG = DOMAIN_CONFIG.get("default_tag")
 TIME_WINDOWS = DOMAIN_CONFIG.get("time_windows", [])
 SECURITY_RULES = DOMAIN_CONFIG.get("security_rules", {})
 LIMITS_CONFIG = DOMAIN_CONFIG.get("limits", {})
@@ -77,6 +78,8 @@ DEFAULT_EVENTS_LIMIT = LIMITS_CONFIG.get("default_events", 100)
 MONGO_INDEXES = DOMAIN_CONFIG.get("mongo_indexes", ["timestamp", "camera_id", "event_type"])
 LLM_CONFIG = DOMAIN_CONFIG.get("llm", {})
 LLM_CATEGORIES = LLM_CONFIG.get("categories", [])
+
+CRITICAL_CATEGORIES = LLM_CONFIG.get("critical_categories", ["ANOMALIA ESPLICITA"])
 LLM_LANGUAGE = LLM_CONFIG.get("language", "it")
 LLM_TEMPERATURE = LLM_CONFIG.get("temperature", 0.1)
 LLM_MIN_NUM_CTX = LLM_CONFIG.get("min_num_ctx", 4096)
@@ -143,28 +146,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+#traduce i tag grezzi in etichette leggibili usando le definizioni nel config.yaml
+def _describe_tags(tags: list) -> str:
+    tags = tags or []
+    if not tags:
+        tags = [DEFAULT_TAG] if DEFAULT_TAG else []
+    if not tags:
+        return "nessun tag assegnato"
 
-def _find_time_window(t) -> Optional[dict]:
-    """Trova la fascia oraria (da TIME_WINDOWS) in cui cade l'orario `t` (datetime.time).
-    Calcolato deterministicamente in Python invece di lasciarlo indovinare all'LLM,
-    che su modelli piccoli tende a sbagliare il confronto numerico tra orari,
-    specialmente su fasce che attraversano la mezzanotte (es. 22:00–06:00)."""
-    for tw in TIME_WINDOWS:
-        start = time.fromisoformat(tw["start"])
-        end = time.fromisoformat(tw["end"])
-        if start <= end:
-            if start <= t < end:
-                return tw
+    etichette = []
+    for t in tags:
+        definizione = TAG_DEFINITIONS.get(t)
+        if definizione:
+            etichette.append(definizione.get("label", t))
         else:
-            # Fascia che attraversa la mezzanotte (es. 22:00-06:00)
-            if t >= start or t < end:
-                return tw
-    return None
+            etichette.append(f"{t} (non documentato in config.yaml)")
+    return ", ".join(etichette)
 
 
-_RESTRICTED_CAMERA_IDS = {
-    r.get("camera_id") for r in SECURITY_RULES.get("restricted_cameras", [])
-}
+def _build_tag_legend() -> str:
+    if not TAG_DEFINITIONS:
+        return ""
+    righe = [
+        f"  - {v.get('label', k)} (tag: \"{k}\"): {v.get('description', '')}"
+        for k, v in TAG_DEFINITIONS.items()
+    ]
+    return "SIGNIFICATO DEI TAG SOGGETTO:\n" + "\n".join(righe)
 
 
 def _build_contesto_struttura() -> str:
@@ -183,6 +190,9 @@ def _build_contesto_struttura() -> str:
         criteri_txt_righe.append(f"  - {regola['rule']}")
     criteri_txt = "\n".join(criteri_txt_righe)
 
+    tag_legend_txt = _build_tag_legend()
+    tag_legend_block = f"\n\n{tag_legend_txt}" if tag_legend_txt else ""
+
     return f"""CONTESTO DELLA STRUTTURA:
 
 TELECAMERE E MAPPA DELLE ZONE:
@@ -192,7 +202,7 @@ FASCE ORARIE DELLA STRUTTURA:
 {fasce_orarie_txt}
 
 CRITERI DI SICUREZZA E NORMALITÀ:
-{criteri_txt}"""
+{criteri_txt}{tag_legend_block}"""
 
 
 CONTESTO_STRUTTURA = _build_contesto_struttura()
@@ -220,10 +230,6 @@ class Event(BaseModel):
     @field_validator("timestamp")
     @classmethod
     def normalize_timestamp(cls, v: datetime) -> datetime:
-        # Se il timestamp arriva senza timezone (es. da una sorgente locale),
-        # assumiamo sia orario locale (Europe/Rome) e lo convertiamo esplicitamente
-        # in UTC, in modo che venga salvato in Mongo come BSON Date coerente e
-        # confrontabile con le query del worker/backend, che lavorano sempre in UTC.
         if v.tzinfo is None:
             v = v.replace(tzinfo=LOCAL_TZ)
         return v.astimezone(timezone.utc)
@@ -238,6 +244,8 @@ class SummaryRequest(BaseModel):
         description="Fine periodo. Se omesso, viene usata la fine della giornata corrente (23:59:59 di oggi)."
     )
     camera_ids: list[str] = Field(default_factory=list, description="Lista di camere su cui filtrare")
+    tipi_eventi: list[str] = Field(default_factory=list,
+                                   description="Filtro tipi evento selezionati dall'utente")
     custom_prompt: Optional[str] = Field(default=None, description="Prompt personalizzato opzionale dell'utente")
     excluded_ids: list[str] = Field(
         default_factory=list,
@@ -322,22 +330,18 @@ def _build_time_query(start: datetime, end: datetime) -> dict:
                 tzinfo=timezone.utc
             )
 
-        # Finestra locale corrispondente, usata per il fallback su stringhe naive
         window_start_local = window_start.astimezone(LOCAL_TZ)
         window_end_local = window_end.astimezone(LOCAL_TZ)
 
         clauses.extend([
-            # 1. Stringhe ISO con offset UTC esplicito (es. '...+00:00')
             {FIELD_TIMESTAMP: {
                 "$gte": window_start.isoformat(),
                 "$lte": window_end.isoformat()
             }},
-            # 2. Stringhe naive in orario locale (es. dati storici tipo init.js)
             {FIELD_TIMESTAMP: {
                 "$gte": window_start_local.strftime("%Y-%m-%dT%H:%M:%S"),
                 "$lte": window_end_local.strftime("%Y-%m-%dT%H:%M:%S")
             }},
-            # 3. Veri oggetti Date BSON (comportamento attuale dopo la normalizzazione)
             {FIELD_TIMESTAMP: {
                 "$gte": window_start,
                 "$lte": window_end
@@ -353,11 +357,9 @@ def _build_last_Nminutes_query(reference: datetime, minutes: int) -> dict:
     ref_utc = _to_utc(reference)
     start_utc = ref_utc - timedelta(minutes=minutes)
 
-    # Orari in UTC
     start_iso_utc = start_utc.isoformat()
     ref_iso_utc = ref_utc.isoformat()
 
-    # Orari in Timezone Locale (es. Europe/Rome) senza tzinfo per matchare stringhe naive
     ref_local = reference.astimezone(LOCAL_TZ) if reference.tzinfo else reference
     start_local = ref_local - timedelta(minutes=minutes)
 
@@ -366,28 +368,18 @@ def _build_last_Nminutes_query(reference: datetime, minutes: int) -> dict:
 
     return {
         "$or": [
-            # 1. Matching per stringhe con offset ISO (es: '2026-07-23T15:25:00+00:00')
             {FIELD_TIMESTAMP: {"$gte": start_iso_utc, "$lte": ref_iso_utc}},
-
-            # 2. Matching per stringhe naive locali (es: '2026-07-23T17:25:00')
             {FIELD_TIMESTAMP: {"$gte": start_str_naive, "$lte": end_str_naive}},
-
-            # 3. Matching per veri oggetti Date BSON in Mongo
             {FIELD_TIMESTAMP: {"$gte": start_utc, "$lte": ref_utc}}
         ]
     }
 
 def _local_midnight(reference: datetime) -> datetime:
-    """Restituisce la mezzanotte (00:00:00) locale del giorno di 'reference'."""
     ref_local = reference.astimezone(LOCAL_TZ) if reference.tzinfo else reference.replace(tzinfo=LOCAL_TZ)
     return ref_local.replace(hour=0, minute=0, second=0, microsecond=0)
 
-
+#restituisce numeor di eventi avvenuti in una specifca giornata fino all'ora inserita
 async def count_events_until(reference: datetime) -> int:
-    """
-    Dato un datetime, restituisce il numero di eventi avvenuti in quella
-    giornata (dalla mezzanotte locale) fino a quell'ora e minuto compresi.
-    """
     inizio_giorno = _local_midnight(reference)
     ref = reference if reference.tzinfo else reference.replace(tzinfo=LOCAL_TZ)
     query = _build_time_query(inizio_giorno, ref)
@@ -395,7 +387,6 @@ async def count_events_until(reference: datetime) -> int:
 
 
 async def get_daily_counts(reference: Optional[datetime] = None) -> dict:
-    """Numero di eventi di oggi (dalla mezzanotte a 'reference')."""
     now = reference.astimezone(LOCAL_TZ) if reference else datetime.now(LOCAL_TZ)
     eventi_oggi = await count_events_until(now)
 
@@ -403,73 +394,6 @@ async def get_daily_counts(reference: Optional[datetime] = None) -> dict:
         "riferimento": now.isoformat(),
         "eventi_oggi": eventi_oggi,
     }
-
-#prompt che indidua solo eventi critici e li restiuisce con JSON
-# prompt che individua solo eventi critici richiedendo una decisione esplicita (critico: true/false)
-def _build_critical_events_prompt(events: list[dict]) -> str:
-    righe = []
-    for e in events:
-        tags = get_nested_field(e, FIELD_TAGS, [])
-        soggetto = "dipendente" if EMPLOYEE_TAG in tags else "visitatore/cliente (non dipendente)"
-        ts = e.get(FIELD_TIMESTAMP)
-        if isinstance(ts, str):
-            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        if ts.tzinfo is not None:
-            ts = ts.astimezone(LOCAL_TZ)
-        data_ora = ts.strftime("%d/%m/%Y %H:%M")
-
-        fascia = _find_time_window(ts.time())
-        fascia_label = fascia["label"] if fascia else "Sconosciuta"
-
-        camera_id = e.get(FIELD_CAMERA)
-        zona = "RISERVATA" if camera_id in _RESTRICTED_CAMERA_IDS else "pubblica/standard"
-
-        righe.append(
-            f'- id:"{e.get("_id")}" | [{data_ora}] {camera_id} ({e.get(FIELD_LOCATION)}) '
-            f'| {e.get(FIELD_DESCRIPTION)} | tipo:{e.get(FIELD_TYPE)} | soggetto:{soggetto} '
-            f'| fascia_oraria:{fascia_label} | zona:{zona}'
-        )
-    eventi_txt = "\n".join(righe)
-    n = len(events)
-
-    return f"""{PROMPT_SUMMARY_INTRO}
-{CONTESTO_STRUTTURA}
-
-COMPITO:
-Analizza i seguenti {n} eventi uno per uno.
-Per ogni evento sono già indicati "fascia_oraria" e "zona": NON ricalcolare tu l'orario, usa
-direttamente questi due valori e confrontali con le note delle FASCE ORARIE e con i CRITERI DI
-SICUREZZA definiti sopra nel CONTESTO DELLA STRUTTURA per decidere se l'evento è critico.
-Per OGNI evento inserito nella lista, esprimi un giudizio esplicito indicando se è CRITICO oppure NO.
-Un evento è critico (critico: true) solo se, incrociando fascia_oraria, zona e soggetto,
-viola uno dei criteri sopra descritti.
-Un evento è normale (critico: false) in tutti gli altri casi.
-IMPORTANTE:
-- La sola presenza di un visitatore/cliente (non dipendente) NON è di per sé un motivo di
-  criticità — lo è solo se il CONTESTO DELLA STRUTTURA per quella fascia_oraria/zona lo qualifica
-  esplicitamente come tale (es. orario notturno, zona RISERVATA, fuori orario).
-- Non saltare o riassumere eventi: devi restituire una valutazione per TUTTI e {n} gli eventi elencati,
-  senza eccezioni, anche se molti si assomigliano tra loro.
-
-REGOLE DI RISPOSTA (OBBLIGATORIE):
- - Rispondi SOLO con un array JSON valido contenente un oggetto per ciascun evento analizzato ({n} oggetti totali). Nessun testo prima o dopo, nessun commento, nessun Markdown.
- - Ogni elemento dell'array deve avere ESATTAMENTE questi campi:
-   "id" (l'id dell'evento fornito),
-   "critico" (boolean: true se critico, false se normale),
-   "motivo" (spiegazione breve in {LLM_RESPONSE_LANGUAGE} della tua valutazione)
- - Non inventare id che non sono nella lista fornita.
-
-EVENTI DA ANALIZZARE:
-{eventi_txt}
-
-JSON:"""
-
-
-# Numero massimo di eventi per chiamata LLM: batch più corti riducono il rischio
-# che un modello piccolo "perda" eventi in mezzo a una lista lunga (effetto
-# lost-in-the-middle), a costo di più chiamate quando gli eventi del giorno sono tanti.
-CRITICAL_BATCH_SIZE = int(os.getenv("CRITICAL_BATCH_SIZE", "12"))
-
 
 def _parse_json_array(raw: str) -> list[dict]:
     if not raw:
@@ -511,53 +435,121 @@ def _formatta_evento_critico(eid: str, e: dict, motivo: str) -> dict:
     }
 
 
-async def _analizza_batch_critico(events: list[dict]) -> list[dict]:
-    prompt = _build_critical_events_prompt(events)
-    raw = await call_llm(prompt, n_events=len(events))
-    valutazioni = _parse_json_array(raw)
+def _riga_evento_per_prompt(e: dict) -> str:
+    tags = get_nested_field(e, FIELD_TAGS, [])
+    soggetto = _describe_tags(tags)
+    ts = e.get(FIELD_TIMESTAMP)
+    if isinstance(ts, str):
+        ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    if ts.tzinfo is not None:
+        ts = ts.astimezone(LOCAL_TZ)
+    data_ora = ts.strftime("%d/%m/%Y %H:%M")
+    camera_id   = e.get(FIELD_CAMERA)
+    location    = e.get(FIELD_LOCATION)
+    description = e.get(FIELD_DESCRIPTION)
+    return f'- id:"{e.get("_id")}" | [{data_ora}] {camera_id} ({location}) | {description} | soggetto:{soggetto}'
 
-    events_by_id = {str(e.get("_id")): e for e in events}
-    eventi_critici = []
-    for item in valutazioni:
-        eid = str(item.get("id", ""))
-        if eid in events_by_id and item.get("critico") is True:
-            eventi_critici.append(
-                _formatta_evento_critico(eid, events_by_id[eid], item.get("motivo", "Nessuna motivazione fornita"))
-            )
-    return eventi_critici
+def _normalizza_categoria(s: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+_CRITICAL_CATEGORIES_NORM = {_normalizza_categoria(c) for c in CRITICAL_CATEGORIES}
 
 
-# Chiede al provider di individuare gli eventi critici, elaborando a blocchi per
-# ridurre il rischio che eventi vengano "persi" su liste lunghe.
+def _build_critical_classification_prompt(events: list[dict]) -> str:
+    eventi_txt = "\n".join(_riga_evento_per_prompt(e) for e in events)
+    n = len(events)
+
+    nomi_categorie = [c["name"] for c in LLM_CATEGORIES]
+    guida_categorie_txt = "\n".join(
+        f"  {c['name']:<24}→ {c['guida']}" for c in LLM_CATEGORIES
+    )
+
+    return f"""{PROMPT_SUMMARY_INTRO}
+{CONTESTO_STRUTTURA}
+
+GUIDA ALLE CATEGORIE (usala per assegnare ogni evento):
+{guida_categorie_txt}
+
+HAI RICEVUTO ESATTAMENTE {n} EVENTI, ognuno con un "id" univoco:
+{eventi_txt}
+
+COMPITO: per OGNI id qui sopra, assegna ESATTAMENTE UNA categoria tra: {", ".join(nomi_categorie)}.
+Scrivi anche un breve motivo (in {LLM_RESPONSE_LANGUAGE}) per la classificazione.
+
+REGOLE DI RISPOSTA (OBBLIGATORIE):
+ - Rispondi SOLO con un array JSON valido, nessun testo prima o dopo, nessun commento, nessun Markdown.
+ - L'array deve contenere ESATTAMENTE {n} elementi, uno per ciascun id ricevuto, ognuno una sola volta.
+ - Ogni elemento deve avere ESATTAMENTE questi campi: "id" (uguale a uno di quelli forniti sopra), "categoria" (una delle categorie elencate, testo identico), "motivo" (spiegazione breve).
+ - Non inventare id che non sono nella lista fornita.
+
+JSON:"""
+
+
 async def analizza_eventi_critici(events: list[dict]) -> list[dict]:
     if not events:
         return []
 
-    eventi_critici: list[dict] = []
-    for i in range(0, len(events), CRITICAL_BATCH_SIZE):
-        batch = events[i:i + CRITICAL_BATCH_SIZE]
-        eventi_critici.extend(await _analizza_batch_critico(batch))
+    prompt = _build_critical_classification_prompt(events)
+    raw = await call_llm(prompt, n_events=len(events))
+    classificazione = _parse_json_array(raw)
+
+    if not classificazione:
+        print(f"[LLM][critici] Risposta non parsabile come JSON array. Raw: {raw[:500]!r}")
+        return []
+
+    events_by_id = {str(e.get("_id")): e for e in events}
+    eventi_critici = []
+    for item in classificazione:
+        eid = str(item.get("id", ""))
+        if eid not in events_by_id:
+            continue
+        if _normalizza_categoria(item.get("categoria")) not in _CRITICAL_CATEGORIES_NORM:
+            continue
+        motivo = item.get("motivo", "Nessuna motivazione fornita")
+        eventi_critici.append(_formatta_evento_critico(eid, events_by_id[eid], motivo))
+
+    if not eventi_critici:
+        distribuzione = {}
+        for item in classificazione:
+            cat = item.get("categoria", "<mancante>")
+            distribuzione[cat] = distribuzione.get(cat, 0) + 1
+        print(
+            f"[LLM][critici] Nessun evento nelle categorie critiche {sorted(CRITICAL_CATEGORIES)} "
+            f"su {len(events)} eventi. Distribuzione categorie restituite dal modello: {distribuzione}"
+        )
 
     return eventi_critici
 
 
 _critical_recompute_lock = asyncio.Lock()
 
+CRITICAL_RECOMPUTE_DEBOUNCE_SECONDS = float(os.getenv("CRITICAL_RECOMPUTE_DEBOUNCE_SECONDS", "5"))
+_critical_recompute_debounce_task: Optional[asyncio.Task] = None
+
+
+async def _debounced_critical_recompute():
+    global _critical_recompute_debounce_task
+    try:
+        await asyncio.sleep(CRITICAL_RECOMPUTE_DEBOUNCE_SECONDS)
+        await recompute_critical_cache()
+    except Exception as e:
+        print(f"[API] Ricalcolo eventi critici (trigger da inserimento) fallito: {e}")
+    finally:
+        _critical_recompute_debounce_task = None
+
+
+def _schedule_critical_recompute_if_today(event_ts: datetime) -> None:
+    global _critical_recompute_debounce_task
+
+    ts = event_ts if event_ts.tzinfo else event_ts.replace(tzinfo=LOCAL_TZ)
+    if ts.astimezone(LOCAL_TZ).date() != datetime.now(LOCAL_TZ).date():
+        return  # evento non di oggi (es. seeding storico): non tocchiamo la cache odierna
+
+    if _critical_recompute_debounce_task is None or _critical_recompute_debounce_task.done():
+        _critical_recompute_debounce_task = asyncio.create_task(_debounced_critical_recompute())
+
 
 async def recompute_critical_cache() -> dict:
-    """Ricalcola e salva in cache gli eventi critici della giornata odierna.
-
-    Valutazione INCREMENTALE: rispetto alla cache già salvata per oggi, chiediamo
-    all'LLM di classificare solo gli eventi NON ancora valutati, non l'intera
-    giornata da capo. Questo tiene bassa la latenza (importante man mano che gli
-    eventi di oggi si accumulano) ed evita di rifare lavoro identico ad ogni
-    trigger del watcher.
-
-    Il lock evita che due ricalcoli sovrapposti (es. uno partito dal worker e uno
-    lanciato a mano da /docs mentre il primo è ancora in corso) possano finire in
-    ordine invertito e sovrascriversi a vicenda, lasciando in cache un risultato
-    più vecchio di quello reale.
-    """
     async with _critical_recompute_lock:
         oggi = datetime.now(LOCAL_TZ).date()
         oggi_iso = oggi.isoformat()
@@ -568,25 +560,21 @@ async def recompute_critical_cache() -> dict:
         cursor = collection.find(query).sort(FIELD_TIMESTAMP, 1)
         events = [doc_to_event(doc) async for doc in cursor]
 
-        cache_esistente = await critical_collection.find_one({"data": oggi_iso})
-        # Se la cache esistente non è di oggi (giorno cambiato) la ignoriamo.
-        if cache_esistente and cache_esistente.get("data") == oggi_iso:
-            id_gia_valutati = set(cache_esistente.get("id_eventi_valutati", []))
-            eventi_critici_precedenti = cache_esistente.get("eventi_critici", [])
-        else:
-            id_gia_valutati = set()
-            eventi_critici_precedenti = []
+        await critical_collection.update_one(
+            {"data": oggi_iso},
+            {"$set": {"data": oggi_iso, "in_elaborazione": True}},
+            upsert=True,
+        )
 
-        eventi_nuovi = [e for e in events if e.get("_id") not in id_gia_valutati]
+        try:
+            eventi_critici = await analizza_eventi_critici(events) if events else []
+        except Exception:
+            await critical_collection.update_one(
+                {"data": oggi_iso}, {"$set": {"in_elaborazione": False}}, upsert=True
+            )
+            raise
 
-        critici_nuovi = await analizza_eventi_critici(eventi_nuovi) if eventi_nuovi else []
-
-        eventi_critici = eventi_critici_precedenti + critici_nuovi
-        # Le date sono tutte di oggi ("dd/mm/yyyy HH:MM"): ordinamento lessicografico
-        # coincide con quello cronologico.
         eventi_critici.sort(key=lambda ev: ev.get("timestamp", ""))
-
-        id_valutati_aggiornati = list(id_gia_valutati | {e.get("_id") for e in eventi_nuovi})
 
         llm_label = (
             f"OpenAI ({OPENAI_MODEL})" if LLM_PROVIDER == "openai" else f"Ollama ({OLLAMA_MODEL})"
@@ -599,8 +587,8 @@ async def recompute_critical_cache() -> dict:
             "numero_eventi_totali": len(events),
             "numero_critici": len(eventi_critici),
             "eventi_critici": eventi_critici,
-            "id_eventi_valutati": id_valutati_aggiornati,
             "LLM": llm_label,
+            "in_elaborazione": False,
         }
 
         await critical_collection.update_one(
@@ -753,22 +741,7 @@ async def check_llm_status() -> dict:
 def _build_summary_prompt(
     events: list[dict],
 ) -> str:
-    righe = []
-    for e in events:
-        tags = get_nested_field(e, FIELD_TAGS, [])
-        soggetto = "dipendente" if EMPLOYEE_TAG in tags else "visitatore/cliente (non dipendente)"
-        ts = e.get(FIELD_TIMESTAMP)
-        if isinstance(ts, str):
-            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        if ts.tzinfo is not None:
-            ts = ts.astimezone(LOCAL_TZ)
-        data_ora = ts.strftime("%d/%m/%Y %H:%M")
-        camera_id   = e.get(FIELD_CAMERA)
-        location    = e.get(FIELD_LOCATION)
-        description = e.get(FIELD_DESCRIPTION)
-        righe.append(
-            f'- id:"{e.get("_id")}" | [{data_ora}] {camera_id} ({location}) | {description} | soggetto:{soggetto}'
-        )
+    righe = [_riga_evento_per_prompt(e) for e in events]
     eventi_txt = "\n".join(righe)
     n = len(events)
 
@@ -799,13 +772,6 @@ JSON:"""
 
 
 def _render_summary_sections(events: list[dict], classificazione: list[dict]) -> str:
-    """
-    Assembla il testo finale a sezioni (### Categoria) a partire dagli eventi
-    originali e dalla classificazione id->categoria restituita dall'LLM.
-    L'assemblaggio è fatto qui, in modo deterministico: ogni evento viene
-    inserito al massimo una volta, indipendentemente da eventuali id
-    duplicati o ripetuti nella risposta del modello.
-    """
     eventi_by_id = {str(e.get("_id")): e for e in events}
     nomi_categorie = [c["name"] for c in LLM_CATEGORIES]
 
@@ -839,9 +805,6 @@ def _render_summary_sections(events: list[dict], classificazione: list[dict]) ->
             categoria, motivo = assegnazione[eid]
             sezioni[categoria].append(_riga(e, motivo))
         else:
-            # Il modello non ha classificato questo evento (o l'ha assegnato
-            # a una categoria inesistente): lo segnaliamo comunque, non lo
-            # perdiamo silenziosamente.
             non_classificati.append(_riga(e, ""))
 
     blocchi = []
@@ -859,7 +822,7 @@ def _build_custom_prompt(events: list[dict], custom_prompt: str) -> str:
     righe_lista = []
     for e in events:
         tags = get_nested_field(e, FIELD_TAGS, [])
-        soggetto = "dipendente" if EMPLOYEE_TAG in tags else "visitatore/cliente (non dipendente)"
+        soggetto = _describe_tags(tags)
         ts = e.get(FIELD_TIMESTAMP)
         if isinstance(ts, str):
             ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
@@ -933,10 +896,23 @@ def get_cameras():
     }
 
 
+# ENDPOINT — TIPI EVENTO
+# Espone i tipi evento ammessi (config.yaml -> event_types) così che i client
+# (dashboard, ecc.) non debbano ridefinirli localmente: un'unica fonte di
+# verità lato backend, coerente con ALLOWED_EVENT_TYPES usato in validazione.
+@app.get("/event_types", tags=["Sistema"])
+def get_event_types():
+    return {
+        "count": len(ALLOWED_EVENT_TYPES),
+        "event_types": sorted(ALLOWED_EVENT_TYPES),
+    }
+
+
 @app.post("/events", status_code=201, tags=["Eventi"])
 async def create_event(event: Event):
     doc    = event_to_doc(event)
     result = await collection.insert_one(doc)
+    _schedule_critical_recompute_if_today(event.timestamp)
     return {
         "status":     "success",
         "id":         str(result.inserted_id),
@@ -1189,11 +1165,10 @@ async def richiedi_summary(req: SummaryRequest, background_tasks: BackgroundTask
     is_prompt = bool(req.custom_prompt and req.custom_prompt.strip())
     target_collection = prompt_collection if is_prompt else analysis_collection
 
-    event_types = sorted({
-        e.get(FIELD_TYPE)
-        for e in events
-        if e.get(FIELD_TYPE)
-    })
+    if req.tipi_eventi:
+        event_types = req.tipi_eventi
+    else:
+        event_types = sorted({e.get(FIELD_TYPE) for e in events if e.get(FIELD_TYPE)})
 
     start_local = req.start if req.start.tzinfo else req.start.replace(tzinfo=LOCAL_TZ)
     end_local = end if end.tzinfo else end.replace(tzinfo=LOCAL_TZ)

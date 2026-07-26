@@ -109,6 +109,8 @@ div[data-testid="stHorizontalBlock"]:has(div[class*="st-key-scheda_"]) > div[dat
     min-width: 140px !important;
     max-width: 220px !important;
     width: auto !important;
+    position: relative !important;
+    padding-top: 8px !important;
 }
 
 div[class*="st-key-scheda_"] button {
@@ -117,15 +119,33 @@ div[class*="st-key-scheda_"] button {
     font-size: 13px !important;
 }
 
+/* POSIZIONAMENTO ASSOLUTO TASTO X IN ALTO A DESTRA */
+div[class*="st-key-scheda_x_"] {
+    position: absolute !important;
+    top: 0px !important;
+    right: 0px !important;
+    z-index: 99 !important;
+    width: auto !important;
+}
+
 div[class*="st-key-scheda_x_"] button {
     padding: 0px !important;
-    min-height: 22px !important;
-    height: 22px !important;
-    width: 22px !important;
-    min-width: 22px !important;
+    min-height: 20px !important;
+    height: 20px !important;
+    width: 20px !important;
+    min-width: 20px !important;
     border-radius: 50% !important;
-    font-size: 11px !important;
+    font-size: 10px !important;
     line-height: 1 !important;
+    background-color: #ffffff !important;
+    color: #333333 !important;
+    border: 1px solid #cccccc !important;
+    box-shadow: 0px 2px 4px rgba(0,0,0,0.15) !important;
+}
+
+div[class*="st-key-scheda_x_"] button:hover {
+    border-color: #ff4b4b !important;
+    color: #ff4b4b !important;
 }
 
 div[class*="st-key-scheda_in_corso_"] button {
@@ -160,7 +180,6 @@ def load_domain_config():
 
 
 DOMAIN_CONFIG = load_domain_config()
-EMPLOYEE_TAG = DOMAIN_CONFIG.get("actor_tags", {}).get("employee", "employee")
 RESTRICTED_CAMERAS = {
     r["camera_id"] for r in DOMAIN_CONFIG.get("security_rules", {}).get("restricted_cameras", [])
 }
@@ -194,6 +213,17 @@ def get_cameras():
         return r.json()["cameras"]
     except Exception as e:
         st.error(f"Errore recupero camere: {e}")
+        return []
+
+
+@st.cache_data(ttl=300)
+def get_event_types():
+    try:
+        r = requests.get(f"{API_BASE_URL}/event_types", timeout=10)
+        r.raise_for_status()
+        return r.json()["event_types"]
+    except Exception as e:
+        st.error(f"Errore recupero tipi evento: {e}")
         return []
 
 
@@ -374,7 +404,6 @@ st.sidebar.divider()
 
 if st.session_state.page == "Dashboard":
     st.sidebar.markdown("### Filtri globali")
-    st.sidebar.caption("I filtri si aggiornano automaticamente ad ogni modifica.")
 
     today = date.today()
     start_date = st.sidebar.date_input("Data iniziale", value=today - timedelta(days=1))
@@ -388,7 +417,7 @@ if st.session_state.page == "Dashboard":
 
     tipi_evento_sel = st.sidebar.multiselect(
         "Tipo evento",
-        ["movement", "idle", "crowd"],
+        get_event_types(),
         default=[],
         placeholder="Tutti i tipi",
     )
@@ -416,7 +445,6 @@ st.sidebar.caption(f"Backend: `{API_BASE_URL}`")
 
 
 ICONA_STATO = {"in_corso": "⏳", "errore": "⚠️", "completato": "✅"}
-
 def render_schede_analisi(storico_analisi, storico_prompt):
     schede = [{**it, "tipo": "standard"} for it in storico_analisi]
     schede += [{**it, "tipo": "prompt"} for it in storico_prompt]
@@ -446,23 +474,23 @@ def render_schede_analisi(storico_analisi, storico_prompt):
         testo_data = _ts(it).strftime("%d/%m/%Y %H:%M")
 
         with col:
-            if st.button(
-                f"{ICONA_STATO.get(stato,'✅')} {testo_data}",
-                key=f"scheda_{stato}_{scheda_id}",
-                use_container_width=True,
-            ):
-                st.session_state.scheda_attiva = (scheda_id, tipo)
-                st.rerun()
+            with st.container(key=f"card_box_{scheda_id}"):
+                if st.button(
+                    "✕",
+                    key=f"scheda_x_{scheda_id}",
+                    use_container_width=False,
+                    help="Rimuovi dalla pagina (resta nello storico)",
+                ):
+                    if nascondi_scheda_analisi(scheda_id, tipo):
+                        st.rerun()
 
-            if st.button(
-                "✕",
-                key=f"scheda_x_{scheda_id}",
-                use_container_width=True,
-                help="Rimuovi dalla pagina (resta nello storico)",
-            ):
-                if nascondi_scheda_analisi(scheda_id, tipo):
+                if st.button(
+                    f"{ICONA_STATO.get(stato,'✅')} {testo_data}",
+                    key=f"scheda_{stato}_{scheda_id}",
+                    use_container_width=True,
+                ):
+                    st.session_state.scheda_attiva = (scheda_id, tipo)
                     st.rerun()
-
 def render_vista_risposta_analisi():
     scheda_id, tipo = st.session_state.scheda_attiva
 
@@ -506,12 +534,12 @@ def _kpi_e_critici_fragment():
     }
     storico_analisi = get_history("analysis") or []
     storico_prompt = get_history("prompt") or []
-    analisi_24h = [
+    oggi_roma = datetime.now(FUSO_ROMA).date()
+    analisi_oggi = [
         it for it in (storico_analisi + storico_prompt)
         if it.get("stato") == "completato" and
            converti_a_roma(it.get("completato_il") or it.get("request_date", "")) and
-           converti_a_roma(it.get("completato_il") or it["request_date"]) >= datetime.now(FUSO_ROMA) - timedelta(
-            hours=24)
+           converti_a_roma(it.get("completato_il") or it["request_date"]).date() == oggi_roma
     ]
 
     n_camere_attive = sum(1 for v in st.session_state.camera_status.values() if v)
@@ -532,8 +560,7 @@ def _kpi_e_critici_fragment():
     with k3:
         st.metric("Telecamere attive", f"{n_camere_attive} / {n_camere_totali}")
     with k4:
-        st.metric("Analisi AI completate", len(analisi_24h))
-
+        st.metric("Analisi AI completate", len(analisi_oggi))
     st.markdown("")
     with st.container(key="critical_box"):
         st.markdown("#### Eventi critici · oggi (analisi LLM)")
@@ -550,17 +577,14 @@ def _kpi_e_critici_fragment():
                     dt_roma = converti_a_roma(e.get("timestamp", ""))
                     testo_data = dt_roma.strftime("%d/%m/%Y %H:%M") if dt_roma else e.get("timestamp", "-")
 
-                    desc = e.get('description', '-')
-                    loc = e.get('location')
-                    if loc:
-                        desc_completa = f"{desc} ({loc})"
-                    else:
-                        desc_completa = desc
+                    camera_id = e.get("camera_id") or "-"
+                    loc = e.get("location")
+                    telecamera = f"{camera_id} ({loc})" if loc else camera_id
 
-                    motivo = e.get('motivo', '')
+                    desc = e.get("description", "-")
 
-                    # Formattazione: data e ora | descrizione evento | motivazione del LLM
-                    st.markdown(f"**{testo_data}** | {desc_completa} | _{motivo}_")
+                    # Formattazione: data e ora | telecamera | descrizione evento
+                    st.markdown(f"**{testo_data}** | {telecamera} | {desc}")
                     st.divider()
 
         aggiornato_il = critici_oggi_data.get("aggiornato_il")
@@ -568,6 +592,23 @@ def _kpi_e_critici_fragment():
             dt_agg = converti_a_roma(aggiornato_il)
             if dt_agg:
                 st.caption(f"Ultimo aggiornamento LLM: {dt_agg.strftime('%d/%m/%Y %H:%M:%S')}")
+    if critici_oggi_data.get("in_elaborazione"):
+        st.markdown(
+            """
+            <div style="display:flex;align-items:center;gap:8px;margin-top:6px;">
+              <div style="width:14px;height:14px;border:2px solid #d33;
+                          border-top-color:transparent;border-radius:50%;
+                          animation:spin_critici 0.8s linear infinite;"></div>
+              <span style="color:#d33;font-size:0.85rem;">
+                Nuovi eventi rilevati, aggiornamento dell'analisi in corso...
+              </span>
+            </div>
+            <style>
+            @keyframes spin_critici { to { transform: rotate(360deg); } }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
 # PAGINA: DASHBOARD (HOME)
 def pagina_dashboard():
     st.title("Dashboard")
@@ -656,6 +697,7 @@ def pagina_dashboard():
                 "custom_prompt": ai_prompt if ai_prompt else None,
                 "selected_events": eventi_inclusi_analisi,
                 "camera_ids": camere_attive,
+                "tipi_eventi": tipi_evento_sel,
             }
             esito = richiedi_analisi_async(payload)
             if esito:
@@ -823,7 +865,7 @@ def pagina_impostazioni():
         with col1:
             job_camere = st.multiselect("Telecamere incluse (vuoto = tutte)", camera_options)
         with col2:
-            job_tipi = st.multiselect("Tipi evento inclusi (vuoto = tutti)", ["movement", "idle", "crowd"])
+            job_tipi = st.multiselect("Tipi evento inclusi (vuoto = tutti)", get_event_types())
 
         job_prompt = st.text_area(
             "Prompt personalizzato (opzionale)",
@@ -991,6 +1033,37 @@ def pagina_storico():
                     if delete_history_item(kind, item["_id"]):
                         st.rerun()
 
+            # Modello LLM utilizzato
+            llm_usato = item.get("LLM") or "N/D"
+            st.caption(f" Modello LLM: {llm_usato}")
+
+            # Intervallo temporale della selezione fatta prima della chiamata
+            data_inizio = item.get("data_inizio")
+            ora_inizio = item.get("ora_inizio")
+            data_fine = item.get("data_fine")
+            ora_fine = item.get("ora_fine")
+            if data_inizio and data_fine:
+                if data_inizio == data_fine:
+                    intervallo_txt = f"{data_inizio} {ora_inizio or ''} → {ora_fine or ''}".strip()
+                else:
+                    intervallo_txt = f"{data_inizio} {ora_inizio or ''} → {data_fine} {ora_fine or ''}".strip()
+                st.caption(f" Intervallo: {intervallo_txt}")
+
+            camere = item.get("camera_ids") or []
+            camere_txt = ", ".join(camere) if camere else "Tutte"
+            st.caption(f" Telecamere incluse: {camere_txt}")
+
+            tipi_evento = item.get("tipi_eventi") or []
+            tipi_evento_txt = ", ".join(tipi_evento) if tipi_evento else "Tutti"
+            st.caption(f" Tipi evento inclusi: {tipi_evento_txt}")
+
+            # Solo per la vista "Risposte ai prompt": prompt personalizzato usato
+            prompt_usato = item.get("prompt")
+            if prompt_usato:
+                st.caption(" Prompt personalizzato:")
+                st.markdown(f"> {prompt_usato}")
+
+            st.divider()
             st.write(item["risposta"])
 
 
@@ -1003,4 +1076,4 @@ elif st.session_state.page == "Storico risposte":
     pagina_storico()
 
 st.divider()
-st.caption("Sistema di archiviazione, rilevazione e sintesi eventi — FastAPI + Streamlit")
+st.caption("Sistema di archiviazione, rilevazione e sintesi eventi")

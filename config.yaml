@@ -6,9 +6,57 @@ event_types:
   - crowd
   - idle
 
-# Tag che identifica un soggetto come "dipendente" all'interno di metadata.tags
-actor_tags:
-  employee: employee
+#siginificato semantico dei tag
+tag_definitions:
+  person:
+    label: "Persona (non dipendente)"
+    description: >-
+      Soggetto singolo non identificato come dipendente: presumibilmente
+      cliente o visitatore esterno.
+  employee:
+    label: "Dipendente"
+    description: >-
+      Membro del personale dipendente della struttura, autorizzato alla
+      presenza secondo il proprio ruolo e l'orario di lavoro.
+  group:
+    label: "Gruppo di persone"
+    description: >-
+      Il soggetto rilevato è un gruppo di più persone anziché un singolo
+      individuo. Lo stato dipendente/esterno del gruppo va dedotto da un
+      eventuale altro tag presente sullo stesso evento (es. "employee" se è
+      un gruppo di dipendenti; in assenza di tale tag, considerare il gruppo
+      come composto da persone esterne).
+
+  walking:
+    label: "In cammino"
+    description: "Il soggetto si sta muovendo a piedi nell'ambiente: transito ordinario."
+  door:
+    label: "Presso una porta"
+    description: "Il soggetto si trova nei pressi di una porta o di un'uscita."
+  transit:
+    label: "In transito"
+    description: "Il soggetto sta attraversando o entrando rapidamente in una zona."
+  vending_machine:
+    label: "Al distributore automatico"
+    description: "Il soggetto è fermo presso un distributore automatico."
+  break:
+    label: "In pausa"
+    description: "Il soggetto (tipicamente un dipendente) si trova in pausa lavorativa."
+  phone:
+    label: "Al telefono"
+    description: "Il soggetto è fermo, intento a usare il cellulare."
+  discussion:
+    label: "In conversazione"
+    description: "Il soggetto/i sono impegnati in una discussione o conversazione."
+  loitering:
+    label: "Sosta prolungata"
+    description: >-
+      Il soggetto/i sostano nella stessa zona da diversi minuti senza
+      un'attività apparente: comportamento da valutare con attenzione
+      rispetto a fascia oraria e zona.
+
+
+default_tag: person
 
 # Registro telecamere, camera_id : location
 cameras:
@@ -70,12 +118,18 @@ llm:
   language: it
   response_language_name: italiano
   domain_description: "una struttura bancaria"
+  critical_batch_size: 12
 
   # Parametri di generazione di default
-  temperature: 0.1
+  temperature: 0.01
   min_num_ctx: 4096
   min_output_tokens: 4096
   tokens_per_event: 100
+
+#categorie considerate "critiche" da inserire nella paina inziale
+  critical_categories:
+    - "ANOMALIA ESPLICITA"
+    - "ANOMALIA CONTESTUALE"
 
   prompts:
     custom_intro: >-
@@ -91,7 +145,7 @@ llm:
   # Categorie di classificazione
   categories:
     - name: "ANOMALIA ESPLICITA"
-      guida: "GRAVE VIOLAZIONE DELLE REGOLE."
+      guida: "GRAVISSIMA VIOLAZIONE DELLE REGOLE."
       esempio_motivo: "spiega perché è una violazione"
     - name: "ANOMALIA CONTESTUALE"
       guida: "evento apparentemente grave ma giustificabile in base a orario, zona o soggetto."
