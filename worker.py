@@ -108,22 +108,16 @@ async def execute_job(job_id: str):
         },
     )
 
-
+#Job in background eseguito ogni EVENTS_WATCH_POLL_SECONDS secondi.
+#Rileva se sono stati inseriti nuovi eventi nel DB (confrontando il conteggio
+#totale) e, in tal caso, richiede all'LLM_PROVIDER un ricalcolo della lista/
+#numero di eventi critici di 'oggi'
 async def watch_new_events():
-    """
-    Job in background eseguito ogni EVENTS_WATCH_POLL_SECONDS secondi.
-    Rileva se sono stati inseriti nuovi eventi nel DB (confrontando il conteggio
-    totale) e, in tal caso, richiede all'LLM_PROVIDER un ricalcolo della lista/
-    numero di eventi critici di 'oggi'. Il ricalcolo è "debounced": se arrivano
-    molti eventi ravvicinati, l'LLM viene interrogato al massimo una volta ogni
-    CRITICAL_RECOMPUTE_MIN_INTERVAL secondi, non ad ogni singolo evento.
-    """
+
     global _last_recomputed_event_count, _last_critical_recompute, _critical_cache_ok_date
 
     oggi = datetime.now(LOCAL_TZ).date()
     if _critical_cache_ok_date != oggi:
-        # Nuovo giorno (o nessun successo ancora registrato): la cache di oggi
-        # va considerata non affidabile finché non riusciamo davvero a calcolarla.
         _critical_cache_ok_date = None
 
     try:
@@ -133,22 +127,11 @@ async def watch_new_events():
         return
 
     is_first_run = _last_recomputed_event_count is None
-    # NB: confrontiamo con il conteggio dell'ULTIMO RICALCOLO RIUSCITO, non
-    # dell'ultimo poll. Se confrontassimo poll-su-poll, un burst di eventi che
-    # arriva più in fretta del ciclo di debounce verrebbe "assorbito" senza
-    # mai far scattare un ricalcolo (bug osservato: seeding che finisce in
-    # pochi secondi, più veloce del debounce di 30s).
     events_changed = (not is_first_run) and current_count != _last_recomputed_event_count
 
     now_monotonic = asyncio.get_event_loop().time()
     debounce_elapsed = (now_monotonic - _last_critical_recompute) >= CRITICAL_RECOMPUTE_MIN_INTERVAL
 
-    # Ricalcoliamo se: è la primissima esecuzione, oppure sono arrivati nuovi
-    # eventi rispetto all'ultimo ricalcolo riuscito, oppure semplicemente non
-    # abbiamo ANCORA una cache valida per oggi (es. il tentativo precedente ha
-    # trovato 0 eventi solo perché il seeding era ancora in corso, o Ollama non
-    # era pronto) — in quest'ultimo caso ritentiamo periodicamente finché non
-    # otteniamo un risultato coerente con lo stato reale del DB.
     need_retry_no_success_yet = _critical_cache_ok_date != oggi
 
     should_recompute = is_first_run or (

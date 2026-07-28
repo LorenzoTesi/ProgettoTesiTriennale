@@ -775,8 +775,6 @@ def _render_summary_sections(events: list[dict], classificazione: list[dict]) ->
     eventi_by_id = {str(e.get("_id")): e for e in events}
     nomi_categorie = [c["name"] for c in LLM_CATEGORIES]
 
-    # id -> (categoria, motivo); la prima assegnazione valida per ogni id vince,
-    # eventuali duplicati restituiti dal modello vengono scartati qui.
     assegnazione: dict[str, tuple[str, str]] = {}
     for item in classificazione:
         eid = str(item.get("id", ""))
@@ -850,8 +848,7 @@ def _build_custom_prompt(events: list[dict], custom_prompt: str) -> str:
     )
 
 #dispatcher per i due tipi di richieste all'LLM: sintesi "standard" a sezioni
-#(classificazione JSON + rendering deterministico in Python, per evitare
-#eventi duplicati o omessi) oppure risposta libera a un prompt personalizzato.
+#(classificazione JSON ) oppure risposta libera a un prompt personalizzato.
 async def genera_sintesi(
     events: list[dict],
     custom_prompt: Optional[str] = None,
@@ -898,8 +895,7 @@ def get_cameras():
 
 # ENDPOINT — TIPI EVENTO
 # Espone i tipi evento ammessi (config.yaml -> event_types) così che i client
-# (dashboard, ecc.) non debbano ridefinirli localmente: un'unica fonte di
-# verità lato backend, coerente con ALLOWED_EVENT_TYPES usato in validazione.
+# (dashboard, ecc.) non debbano ridefinirli localmente
 @app.get("/event_types", tags=["Sistema"])
 def get_event_types():
     return {
@@ -1028,19 +1024,13 @@ async def get_stats(
 # ENDPOINT — CONTATORI GIORNALIERI (per le box in alto della dashboard)
 @app.get("/stats/daily_counts", tags=["Statistiche"])
 async def daily_counts():
-    """Numero di eventi di oggi (dalla mezzanotte a ora:minuto correnti)
-    confrontato con lo stesso intervallo del giorno precedente."""
     return await get_daily_counts()
 
 
 # ENDPOINT — EVENTI CRITICI (individuati dall'LLM_PROVIDER configurato)
 @app.get("/stats/critical_events", tags=["Statistiche"])
 async def critical_events():
-    """
-    Restituisce, dalla cache calcolata in background dal worker (o dall'ultimo
-    ricalcolo manuale), il numero e la lista degli eventi critici individuati
-    dall'LLM per la giornata odierna (dalla mezzanotte a ora).
-    """
+
     oggi = datetime.now(LOCAL_TZ).date()
     doc = await get_critical_cache()
     if doc is None:

@@ -36,6 +36,47 @@ div[data-testid="stMetric"] {
     border-radius: 10px;
     padding: 14px 16px 10px 16px;
 }
+.kpi-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    border-radius: 12px;
+    padding: 16px 18px;
+    border: 1px solid rgba(120,120,120,0.18);
+    height: 100%;
+}
+.kpi-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    border-radius: 10px;
+    font-size: 20px;
+}
+.kpi-label {
+    font-size: 0.85rem;
+    color: rgba(120,120,120,0.95);
+    margin-bottom: 2px;
+}
+.kpi-value {
+    font-size: 1.6rem;
+    font-weight: 700;
+    line-height: 1.2;
+}
+.kpi-sub {
+    font-size: 0.8rem;
+    margin-top: 2px;
+}
+.kpi-blue   { background-color: rgba(59,130,246,0.10);  border-color: rgba(59,130,246,0.30); }
+.kpi-blue   .kpi-icon { background-color: rgba(59,130,246,0.18); color: #2563eb; }
+.kpi-red    { background-color: rgba(239,68,68,0.10);   border-color: rgba(239,68,68,0.35); }
+.kpi-red    .kpi-icon { background-color: rgba(239,68,68,0.18); color: #dc2626; }
+.kpi-green  { background-color: rgba(34,197,94,0.10);   border-color: rgba(34,197,94,0.30); }
+.kpi-green  .kpi-icon { background-color: rgba(34,197,94,0.18); color: #16a34a; }
+.kpi-pink   { background-color: rgba(217,70,239,0.10);  border-color: rgba(217,70,239,0.30); }
+.kpi-pink   .kpi-icon { background-color: rgba(217,70,239,0.18); color: #c026d3; }
 .critical-box {
     border: 1px solid rgba(220,50,50,0.5);
     background-color: rgba(220,50,50,0.06);
@@ -545,22 +586,38 @@ def _kpi_e_critici_fragment():
     n_camere_attive = sum(1 for v in st.session_state.camera_status.values() if v)
     n_camere_totali = len(st.session_state.camera_status) or 1
 
+    def _kpi_card(color_class: str, icon: str, label: str, value, sub: str = "") -> str:
+        sub_html = f'<div class="kpi-sub">{sub}</div>' if sub else ""
+        return (
+            f'<div class="kpi-card {color_class}">'
+            f'<div class="kpi-icon">{icon}</div>'
+            f'<div><div class="kpi-label">{label}</div>'
+            f'<div class="kpi-value">{value}</div>'
+            f'{sub_html}</div>'
+            f'</div>'
+        )
+
     k1, k2, k3, k4 = st.columns(4)
     with k1:
-        st.metric(
-            "Eventi di oggi",
-            conteggi.get("eventi_oggi", 0),
+        st.markdown(
+            _kpi_card("kpi-blue", "📅", "Eventi di oggi", conteggi.get("eventi_oggi", 0)),
+            unsafe_allow_html=True,
         )
     with k2:
-        st.metric(
-            "Eventi critici di oggi",
-            critici_oggi_data.get("numero_critici", 0),
-            delta_color="off",
+        st.markdown(
+            _kpi_card("kpi-red", "⚠️", "Eventi critici di oggi", critici_oggi_data.get("numero_critici", 0)),
+            unsafe_allow_html=True,
         )
     with k3:
-        st.metric("Telecamere attive", f"{n_camere_attive} / {n_camere_totali}")
+        st.markdown(
+            _kpi_card("kpi-green", "🎥", "Telecamere attive", f"{n_camere_attive} / {n_camere_totali}"),
+            unsafe_allow_html=True,
+        )
     with k4:
-        st.metric("Analisi AI completate", len(analisi_oggi))
+        st.markdown(
+            _kpi_card("kpi-pink", "🧠", "Analisi AI completate", len(analisi_oggi)),
+            unsafe_allow_html=True,
+        )
     st.markdown("")
     with st.container(key="critical_box"):
         st.markdown("#### Eventi critici · oggi (analisi LLM)")
